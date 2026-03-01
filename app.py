@@ -2,7 +2,7 @@ import gradio as gr
 import os
 from generate import generate_beat_sync_video
 
-def run_generator(video_files, audio_file, start_time, duration, zoom, motion_speed):
+def run_generator(video_files, audio_file, start_time, duration, zoom, motion_speed, progress=gr.Progress()):
     if not video_files: return None, "Please upload videos."
     if audio_file is None: return None, "Please upload an audio file."
     
@@ -16,7 +16,8 @@ def run_generator(video_files, audio_file, start_time, duration, zoom, motion_sp
             start_time_str=start_time,
             clip_duration=duration,
             zoom=zoom,
-            motion_speed=motion_speed
+            motion_speed=motion_speed,
+            progress=progress
         )
         
         # Format verbose stats
@@ -58,7 +59,7 @@ with gr.Blocks() as demo:
             
             with gr.Row():
                 zoom_input = gr.Slider(label="Stabilization Zoom", minimum=1.0, maximum=1.5, value=1.0, step=0.01)
-                speed_input = gr.Slider(label="Motion Speed", minimum=0.05, maximum=2.0, value=0.25, step=0.05)
+                speed_input = gr.Slider(label="Motion Speed", minimum=0.05, maximum=2.0, value=0.8, step=0.05)
             
             generate_btn = gr.Button("Generate Video", variant="primary", elem_id="generate_btn")
             
