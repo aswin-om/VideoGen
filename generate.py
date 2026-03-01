@@ -1,228 +1,175 @@
 import os
 import random
 import numpy as np
-import glob
 import cv2
 import librosa
-from ultralytics import YOLO
 from moviepy import VideoFileClip, AudioFileClip
 
-# These will be computed dynamically
-fps = 24
-height = 1080
-width = 1080
-duration_seconds = 30
-
-song_path = "bunt-trippin.mp3"
-start_time_str = "0:50"
-end_time_str = "1:20"
-
 def parse_time(time_str):
-    parts = time_str.split(':')
+    if isinstance(time_str, (int, float)):
+        return float(time_str)
+    parts = str(time_str).split(':')
     if len(parts) == 2:
         return int(parts[0]) * 60 + int(parts[1])
-    return int(time_str)
+    try:
+        return float(time_str)
+    except ValueError:
+        return 0
 
-start_time = parse_time(start_time_str)
-end_time = parse_time(end_time_str)
-duration_seconds = end_time - start_time
-
-output_dir = "output"
-frames_dir = "all_frames"
-
-if not os.path.exists(output_dir):
-    os.makedirs(output_dir)
-
-# Initialize YOLO model (will automatically download yolov8n.pt if not present)
-model = YOLO('yolov8n.pt')
-
-def get_focal_point(img):
+def detect_scenes(video_path, threshold=25.0):
     """
-    Uses YOLO to detect the main subject (bike/vehicle/person) 
-    and returns its center coordinates (x, y).
-    If nothing is found, returns the center of the image.
+    Detects scene changes by comparing frame intensity differences.
     """
-    # Disable verbose output to keep console clean
-    results = model(img, verbose=False)
-    boxes = results[0].boxes
+    cap = cv2.VideoCapture(video_path)
+    scene_indices = [0]
+    prev_frame = None
+    frame_count = 0
     
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Only check every 3rd frame for speed
+        if frame_count % 3 == 0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if prev_frame is not None:
+                diff = cv2.absdiff(gray, prev_frame)
+                mean_diff = np.mean(diff)
+                if mean_diff > threshold:
+                    scene_indices.append(frame_count)
+            prev_frame = gray
+        
+        frame_count += 1
+    
+    cap.release()
+    return scene_indices
+
+def get_center_crop(img, target_w, target_h):
     img_h, img_w = img.shape[:2]
-    focal_x, focal_y = img_w // 2, img_h // 2
+    target_aspect = target_w / target_h
+    img_aspect = img_w / img_h
     
-    max_score = 0
-    best_box = None
-    
-    for box in boxes:
-        cls = int(box.cls[0])
-        x1, y1, x2, y2 = box.xyxy[0].tolist()
-        area = (x2 - x1) * (y2 - y1)
-        
-        # Prioritize bicycles (1) and motorcycles (3)
-        score = area
-        if cls in [1, 3]:  
-            score *= 10
-        elif cls in [0, 2, 5, 7]: # person, car, bus, truck
-            score *= 2
-            
-        if score > max_score:
-            max_score = score
-            best_box = (x1, y1, x2, y2)
-            
-    if best_box:
-        x1, y1, x2, y2 = best_box
-        focal_x = int((x1 + x2) / 2)
-        focal_y = int((y1 + y2) / 2)
-        
-    return focal_x, focal_y
-
-def calculate_audio_features(audio_path, start_t, end_t):
-    """
-    Load the specific segment of audio, calculate its tempo, 
-    and derive an appropriate frames per second.
-    """
-    print(f"Loading audio '{audio_path}' from {start_t}s to {end_t}s...")
-    # Load audio segment
-    y, sr = librosa.load(audio_path, offset=start_t, duration=(end_t - start_t))
-    
-    # Calculate tempo (beats per minute)
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-    tempo = float(tempo[0]) if isinstance(tempo, (list, tuple, np.ndarray)) else float(tempo)
-    print(f"Detected tempo: {tempo:.2f} BPM")
-    
-    # We prefer a tempo above 120 so the video is fast-paced
-    # If the detected tempo is slow, we can double it to get the "double time" feel
-    target_tempo = tempo
-    while target_tempo < 120:
-        target_tempo *= 2
-        
-    print(f"Adjusted target tempo: {target_tempo:.2f} BPM")
-    
-    # Calculate FPS based on the tempo so frames change on the beat
-    # For example, if tempo is 120 BPM, that's 2 beats per second.
-    # We might want frames to change every half beat, or on the beat.
-    # Let's say we want a frame duration to match 1/4 of a beat for fast cuts.
-    # bps = target_tempo / 60.0
-    # fps = bps * 4 # e.g., 2 bps * 4 = 8 fps (too slow for smooth video?)
-    # Wait, the user wants the video FPS to match the tempo. 
-    # Usually we want the video output to be a standard frame rate (like 24 or 30), 
-    # and we hold frames for exactly X seconds...
-    # BUT if the user strictly wants the FPS calculated from tempo:
-    
-    beats_per_second = target_tempo / 60.0
-    
-    # Let's have the framerate be a multiple of the beats so they sync naturally.
-    # Say we want exactly 4 frames per beat:
-    calculated_fps = int(beats_per_second * 4) 
-    
-    # Ensure a reasonable minimum/maximum bounds for video FPS
-    calculated_fps = max(12, min(calculated_fps, 60))
-    
-    print(f"Calculated FPS based on tempo: {calculated_fps}")
-    return calculated_fps
-
-def generate_random_video():
-    global fps
-    
-    if os.path.exists(song_path):
-        fps = calculate_audio_features(song_path, start_time, end_time)
+    if img_aspect > target_aspect:
+        new_w = int(img_h * target_aspect)
+        x_offset = (img_w - new_w) // 2
+        cropped_img = img[:, x_offset:x_offset+new_w]
+    elif img_aspect < target_aspect:
+        new_h = int(img_w / target_aspect)
+        y_offset = (img_h - new_h) // 2
+        cropped_img = img[y_offset:y_offset+new_h, :]
     else:
-        print(f"Warning: Audio file '{song_path}' not found. Using default FPS: {fps}")
+        cropped_img = img
         
-    print(f"Scanning for frames in '{frames_dir}'...")
-    # Support common image formats
-    all_frames = glob.glob(os.path.join(frames_dir, "*.jpg"))
-    all_frames.extend(glob.glob(os.path.join(frames_dir, "*.png")))
-    all_frames.extend(glob.glob(os.path.join(frames_dir, "*.jpeg")))
+    return cv2.resize(cropped_img, (target_w, target_h))
+
+def generate_beat_sync_video(video_files, audio_file, start_time_str, clip_duration, output_dir="output"):
+    start_time = parse_time(start_time_str)
+    duration_seconds = float(clip_duration)
+    width, height = 1080, 1080
     
-    if not all_frames:
-        print(f"Error: No frames found in '{frames_dir}' folder.")
-        return
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-    num_frames_needed = duration_seconds * fps
-    print(f"Total available frames: {len(all_frames)}")
-    print(f"Target video duration: {duration_seconds}s at {fps} fps ({num_frames_needed} frames)")
-
-    # Select random frames (with replacement if we need more frames than available)
-    if len(all_frames) >= num_frames_needed:
-        selected_frames = random.sample(all_frames, num_frames_needed)
-    else:
-        selected_frames = random.choices(all_frames, k=num_frames_needed)
-
-    output_path = os.path.join(output_dir, "random_video.mp4")
+    # 1. Audio Analysis (BPM & Beats)
+    print(f"Analyzing audio: {audio_file}")
+    # librosa.load arguments: path, offset, duration
+    y, sr = librosa.load(audio_file, offset=start_time, duration=duration_seconds)
+    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
     
-    # Initialize OpenCV VideoWriter
+    if len(beat_times) == 0:
+        tempo = float(tempo[0]) if isinstance(tempo, (list, tuple, np.ndarray)) else float(tempo)
+        beat_times = np.arange(0, duration_seconds, 60.0 / max(tempo, 60.0))
+    
+    print(f"Detected BPM: {tempo}. Total beats: {len(beat_times)}")
+    
+    # 2. Extract Scenes
+    all_scenes = []
+    for v_path in video_files:
+        print(f"Processing scenes in {v_path}...")
+        scenes = detect_scenes(v_path)
+        cap = cv2.VideoCapture(v_path)
+        total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        for i in range(len(scenes)):
+            s = scenes[i]
+            e = scenes[i+1] if i+1 < len(scenes) else total_f
+            if e - s > 15: # Filter out very short clips
+                all_scenes.append({'path': v_path, 'start': s, 'end': e})
+        cap.release()
+
+    if not all_scenes:
+        print("No scenes found, using full videos as scenes.")
+        for v_path in video_files:
+            cap = cv2.VideoCapture(v_path)
+            all_scenes.append({'path': v_path, 'start': 0, 'end': int(cap.get(cv2.CAP_PROP_FRAME_COUNT))})
+            cap.release()
+
+    # 3. Build Video with Motion Effect
+    fps = 30
+    raw_video_path = os.path.join(output_dir, "raw_generated.mp4")
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    out = cv2.VideoWriter(raw_video_path, fourcc, fps, (width, height))
 
-    print(f"Starting video generation at: {output_path}")
-
-    for idx, frame_path in enumerate(selected_frames, start=1):
-        img = cv2.imread(frame_path)
-        if img is None:
-            print(f"Warning: Could not read frame {frame_path}")
-            continue
-            
-        # Get the focal point using YOLO
-        focal_x, focal_y = get_focal_point(img)
-            
-        # Center crop frame to match target aspect ratio based on focal point
-        img_h, img_w = img.shape[:2]
-        target_aspect = width / height
-        img_aspect = img_w / img_h
+    # We map beats to scene changes
+    # Ensure beats are relative to the start of the audio segment (already handled by librosa load offset)
+    beat_checkpoints = sorted(list(set([0.0] + list(beat_times) + [duration_seconds])))
+    
+    total_frames = 0
+    for i in range(len(beat_checkpoints) - 1):
+        interval_start = beat_checkpoints[i]
+        interval_end = beat_checkpoints[i+1]
+        num_frames = int((interval_end - interval_start) * fps)
         
-        if img_aspect > target_aspect:
-            # Image is wider than target aspect
-            new_w = int(img_h * target_aspect)
-            x_offset = int(focal_x - (new_w / 2))
-            # Clamp offset to make sure crop box stays inside image boundaries
-            x_offset = max(0, min(x_offset, img_w - new_w))
-            cropped_img = img[:, x_offset:x_offset+new_w]
-        elif img_aspect < target_aspect:
-            # Image is taller than target aspect
-            new_h = int(img_w / target_aspect)
-            y_offset = int(focal_y - (new_h / 2))
-            # Clamp offset to make sure crop box stays inside image boundaries
-            y_offset = max(0, min(y_offset, img_h - new_h))
-            cropped_img = img[y_offset:y_offset+new_h, :]
-        else:
-            cropped_img = img
-            
-        # Resize frame to match target dimensions
-        resized_img = cv2.resize(cropped_img, (width, height))
-        out.write(resized_img)
+        if num_frames <= 0: continue
         
-        if idx % 50 == 0 or idx == num_frames_needed:
-            print(f"Processed {idx}/{num_frames_needed} frames")
+        # New scene for every beat
+        scene = random.choice(all_scenes)
+        cap = cv2.VideoCapture(scene['path'])
+        
+        # Pick a random starting point in the scene that has enough buffer
+        # Amplitude of motion is about 5-10 frames
+        amplitude = 6
+        scene_start = scene['start']
+        scene_end = scene['end']
+        
+        # Start somewhere safe in the middle/start of the clip
+        base_frame = random.randint(scene_start + amplitude, max(scene_start + amplitude + 1, scene_end - amplitude - 1))
+        
+        for f_idx in range(num_frames):
+            # Back and forth: 0 -> 1 -> 2 -> 1 -> 0 ...
+            # Using a triangle wave for ping-pong
+            # period = 10 frames
+            period = 8
+            offset = amplitude - abs((f_idx % (2 * period)) - period)
+            
+            target_f = base_frame + offset
+            target_f = max(scene_start, min(target_f, scene_end - 1))
+            
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_f)
+            ret, frame = cap.read()
+            if ret:
+                out.write(get_center_crop(frame, width, height))
+                total_frames += 1
+            else:
+                break
+        cap.release()
 
     out.release()
-    print("Done! Video successfully created.")
-    
-    # Now merge the audio
-    if os.path.exists(song_path):
-        print(f"Merging audio from {start_time_str} to {end_time_str}...")
-        final_output_path = os.path.join(output_dir, "random_video_with_audio.mp4")
-        
-        try:
-            video_clip = VideoFileClip(output_path)
-            # In moviepy v2+, subclip is replaced with subclipped
-            audio_clip = AudioFileClip(song_path).subclipped(start_time, end_time)
-            
-            # Ensure audio matches video duration
-            if audio_clip.duration > video_clip.duration:
-                audio_clip = audio_clip.subclipped(0, video_clip.duration)
-                
-            final_clip = video_clip.with_audio(audio_clip)
-            final_clip.write_videofile(final_output_path, codec="libx264", audio_codec="aac")
-            
-            print(f"Final video with audio saved to: {final_output_path}")
-            
-            # Close clips to free memory
-            video_clip.close()
-            audio_clip.close()
-            final_clip.close()
-            
-        except Exception as e:
-            print(f"Error merging audio: {e}")
 
-if __name__ == "__main__":
-    generate_random_video()
+    # 4. Final Merge
+    final_output_path = os.path.join(output_dir, "sync_motion_final.mp4")
+    try:
+        video_clip = VideoFileClip(raw_video_path)
+        audio_clip = AudioFileClip(audio_file).subclipped(start_time, start_time + (total_frames / fps))
+        
+        final_clip = video_clip.with_audio(audio_clip)
+        final_clip.write_videofile(final_output_path, codec="libx264", audio_codec="aac", fps=fps, logger=None)
+        
+        video_clip.close()
+        audio_clip.close()
+        final_clip.close()
+        return final_output_path
+    except Exception as e:
+        print(f"Error: {e}")
+        return raw_video_path
