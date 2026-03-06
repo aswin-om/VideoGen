@@ -42,8 +42,37 @@ def apply_noise_grain(frame, intensity=0.0):
     return np.clip(noisy_frame, 0, 255).astype(np.uint8)
 
 
+class StepPrinter:
+    """Low shutter / step printing effect (Travis Scott style).
+
+    Blends the current frame with a decaying accumulator of previous frames,
+    producing ghostly motion trails.  ``intensity`` (0–1) controls the decay:
+    0 = no effect, 1 = maximum trailing.
+    """
+
+    def __init__(self, intensity=0.0):
+        self.intensity = float(intensity)
+        self._acc = None
+
+    def process(self, frame):
+        if self.intensity <= 0:
+            return frame
+
+        f32 = frame.astype(np.float32)
+        alpha = self.intensity * 0.85  # blend weight for the trail
+
+        if self._acc is None:
+            self._acc = f32.copy()
+        else:
+            self._acc = alpha * self._acc + (1.0 - alpha) * f32
+
+        blended = 0.5 * f32 + 0.5 * self._acc
+        return np.clip(blended, 0, 255).astype(np.uint8)
+
+
 def render_video(path, video_files, person_cache, crop_mode, zoom,
-                 width, height, fps, noise_intensity, output_dir, progress=None):
+                 width, height, fps, noise_intensity, output_dir, progress=None,
+                 step_print_intensity=0.0):
     """
     Render the timeline to a raw video file.
     Returns (raw_path, frame_usage_array, timestamp) or raises on cancel.
@@ -54,6 +83,7 @@ def render_video(path, video_files, person_cache, crop_mode, zoom,
 
     frame_usage = np.zeros(len(video_files), dtype=np.int32)
     captures = {v: cv2.VideoCapture(v) for v in video_files}
+    printer = StepPrinter(step_print_intensity)
 
     try:
         total = len(path)
@@ -81,6 +111,8 @@ def render_video(path, video_files, person_cache, crop_mode, zoom,
 
                 if noise_intensity > 0:
                     frame = apply_noise_grain(frame, noise_intensity)
+
+                frame = printer.process(frame)
 
                 out.write(frame)
                 frame_usage[v_idx] += 1

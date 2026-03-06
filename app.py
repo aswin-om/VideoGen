@@ -42,7 +42,8 @@ def auto_calculate_settings(video_files, audio_file, start_time, duration,
 
 def run_generator(video_files, audio_file, start_time, duration, zoom,
                   motion_speed, step_repeat, source_stride, noise_intensity,
-                  crop_mode, resolution, target_fps, progress=gr.Progress()):
+                  crop_mode, resolution, target_fps, speed_ramp, step_print,
+                  progress=gr.Progress()):
     if not video_files:
         return None, "Please upload videos."
     if audio_file is None:
@@ -70,6 +71,8 @@ def run_generator(video_files, audio_file, start_time, duration, zoom,
             crop_mode=crop_key,
             resolution=resolution,
             target_fps=target_fps,
+            speed_ramp=speed_ramp,
+            step_print=step_print,
             progress=progress,
         )
 
@@ -148,8 +151,19 @@ with gr.Blocks() as demo:
                 source_stride_input = gr.Slider(label="Source Stride", minimum=1,
                                                 maximum=8, value=1, step=1)
 
-            noise_intensity_input = gr.Slider(label="Noise", minimum=0.0,
-                                              maximum=0.2, value=0.0, step=0.01)
+            with gr.Row():
+                noise_intensity_input = gr.Slider(label="Noise", minimum=0.0,
+                                                  maximum=0.2, value=0.0, step=0.01)
+                speed_ramp_input = gr.Slider(
+                    label="Speed Ramp (φ)", minimum=0.0, maximum=1.0,
+                    value=0.0, step=0.05,
+                    info="0=off, 1=full (slow-mo ↔ fast via golden ratio)"
+                )
+            step_print_input = gr.Slider(
+                label="Step Print", minimum=0.0, maximum=1.0,
+                value=0.0, step=0.05,
+                info="Low shutter / motion trail effect (0=off, 1=max)"
+            )
             crop_mode_input = gr.Radio(
                 label="Crop Mode",
                 choices=["Center", "Content Aware", "Person Tracking (YOLO)"],
@@ -181,7 +195,7 @@ with gr.Blocks() as demo:
         inputs=[video_input, audio_input, start_time_input, duration_input,
                 zoom_input, speed_input, step_repeat_input, source_stride_input,
                 noise_intensity_input, crop_mode_input, resolution_input,
-                fps_input],
+                fps_input, speed_ramp_input, step_print_input],
         outputs=[video_output, status_output],
     )
 

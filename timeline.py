@@ -1,6 +1,8 @@
 import numpy as np
 import cv2
 
+PHI = 1.6180339887  # Golden ratio
+
 
 def build_video_meta(video_files):
     """Get frame count and FPS for each video."""
@@ -16,10 +18,12 @@ def build_video_meta(video_files):
 
 def build_timeline(video_files, video_meta, beat_set, total_output_frames,
                    motion_speed, step_repeat, source_stride, fps,
-                   person_cache=None):
+                   person_cache=None, energy_envelope=None, ramp_intensity=0.0):
     """
     Build frame-by-frame timeline.
     Uses YOLO detection density for smart clip selection when person_cache is provided.
+    When energy_envelope and ramp_intensity > 0, applies speed ramping:
+      quiet → slow-mo (1/φ ≈ 0.618×), loud → fast (φ ≈ 1.618×).
     """
     path = []
     active_vid = 0
@@ -57,7 +61,11 @@ def build_timeline(video_files, video_meta, beat_set, total_output_frames,
         curr_total = video_meta[active_vid]["total"]
         curr_fps = video_meta[active_vid]["fps"]
         frame_idx = int(min(max(0, curr_total - 1), round(source_positions[active_vid])))
-        advance = max(0.25, (curr_fps / fps) * speed_scale)
+
+        # Speed ramping: φ^((2e-1) * intensity)
+        ramp_mult = _speed_multiplier(energy_envelope, i, ramp_intensity)
+        advance = max(0.25, (curr_fps / fps) * speed_scale * ramp_mult)
+
         if (i + 1) % repeat_count == 0:
             source_positions[active_vid] = min(
                 max(0, curr_total - 1),
@@ -67,6 +75,24 @@ def build_timeline(video_files, video_meta, beat_set, total_output_frames,
         frames_since_switch += 1
 
     return path
+
+
+def _speed_multiplier(energy_envelope, frame_idx, ramp_intensity):
+    """
+    Map energy to speed via golden ratio for perceptually balanced dynamics.
+    φ^((2e-1)*intensity) gives:
+      energy=0 → 1/φ ≈ 0.618× (dreamy slow-mo)
+      energy=0.5 → 1.0× (normal)
+      energy=1 → φ ≈ 1.618× (energetic fast-forward)
+    The fast/slow ratio is φ² ≈ 2.618 — a naturally pleasing dynamic range.
+    """
+    if energy_envelope is None or ramp_intensity <= 0:
+        return 1.0
+
+    idx = min(frame_idx, len(energy_envelope) - 1)
+    energy = float(energy_envelope[idx])
+    exponent = (2.0 * energy - 1.0) * ramp_intensity
+    return PHI ** exponent
 
 
 def _pick_best_video(current_vid, video_files, video_meta, source_positions,

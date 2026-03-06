@@ -3,7 +3,7 @@ import json
 import datetime
 import numpy as np
 
-from audio import parse_time, detect_beats, analyze_audio_features
+from audio import parse_time, detect_beats, analyze_audio_features, compute_energy_envelope
 from detection import prescan_person_positions, analyze_video_motion
 from timeline import build_video_meta, build_timeline
 from render import (
@@ -130,6 +130,8 @@ def generate_beat_sync_video(
     crop_mode="center",
     resolution="720p Square (720×720)",
     target_fps="30 fps (Default)",
+    speed_ramp=0.0,
+    step_print=0.0,
     progress=None,
 ):
     if progress:
@@ -156,6 +158,15 @@ def generate_beat_sync_video(
         progress(0.08, desc="Analyzing beats (librosa)...")
     beat_set = detect_beats(audio_file, start_time, duration_seconds, render_fps)
 
+    # Energy envelope for speed ramping
+    energy_envelope = None
+    if speed_ramp > 0:
+        if progress:
+            progress(0.12, desc="Computing energy envelope...")
+        energy_envelope = compute_energy_envelope(
+            audio_file, start_time, duration_seconds, render_fps
+        )
+
     if progress:
         progress(0.2, desc="Indexing videos...")
     video_meta = build_video_meta(video_files)
@@ -178,6 +189,8 @@ def generate_beat_sync_video(
         video_files, video_meta, beat_set, total_output_frames,
         motion_speed, step_repeat, source_stride, render_fps,
         person_cache=person_cache,
+        energy_envelope=energy_envelope,
+        ramp_intensity=speed_ramp,
     )
 
     if is_cancelled():
@@ -189,6 +202,7 @@ def generate_beat_sync_video(
     raw_path, frame_usage, timestamp = render_video(
         path, video_files, person_cache, crop_mode, zoom,
         width, height, render_fps, noise_intensity, output_dir, progress,
+        step_print_intensity=step_print,
     )
 
     # 60fps interpolation
@@ -233,6 +247,8 @@ def generate_beat_sync_video(
             "crop_mode": crop_mode,
             "resolution": resolution,
             "target_fps": target_fps,
+            "speed_ramp": speed_ramp,
+            "step_print": step_print,
         },
         "stats": final_stats,
     }

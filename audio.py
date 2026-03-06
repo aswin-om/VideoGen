@@ -76,3 +76,55 @@ def analyze_audio_features(audio_file, start_time, duration_seconds):
 
 def _default_features():
     return {"bpm": 120, "energy": 0.5, "beat_strength": 0.5, "tempo_category": "medium"}
+
+
+def compute_energy_envelope(audio_file, start_time, duration_seconds, fps):
+    """
+    Compute a smoothed per-frame energy envelope for speed ramping.
+    Returns numpy array of length total_frames with values normalized 0-1.
+    Heavy smoothing ensures buttery speed transitions.
+    """
+    total_frames = int(duration_seconds * fps)
+
+    try:
+        y, sr = librosa.load(audio_file, sr=22050, offset=start_time,
+                             duration=duration_seconds, mono=True)
+        if len(y) < sr * 0.1:
+            return np.full(total_frames, 0.5)
+
+        # RMS energy per librosa frame
+        hop_length = 512
+        rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+
+        # Resample to video frame rate
+        rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr,
+                                           hop_length=hop_length)
+        frame_times = np.arange(total_frames) / fps
+        energy = np.interp(frame_times, rms_times, rms)
+
+        # Normalize to 0-1
+        e_min, e_max = energy.min(), energy.max()
+        if e_max - e_min > 1e-6:
+            energy = (energy - e_min) / (e_max - e_min)
+        else:
+            return np.full(total_frames, 0.5)
+
+        # Heavy gaussian-like smoothing (~1s window) for seamless transitions
+        kernel_size = max(3, int(fps * 1.0)) | 1  # ensure odd
+        kernel = np.ones(kernel_size) / kernel_size
+        energy = np.convolve(energy, kernel, mode='same')
+
+        # Second pass with wider kernel for extra smoothness
+        wide_kernel_size = max(3, int(fps * 0.5)) | 1
+        wide_kernel = np.ones(wide_kernel_size) / wide_kernel_size
+        energy = np.convolve(energy, wide_kernel, mode='same')
+
+        # Re-normalize after smoothing
+        e_min, e_max = energy.min(), energy.max()
+        if e_max - e_min > 1e-6:
+            energy = (energy - e_min) / (e_max - e_min)
+
+        return energy
+
+    except Exception:
+        return np.full(total_frames, 0.5)
