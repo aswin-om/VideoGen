@@ -3,7 +3,7 @@ import json
 import datetime
 import numpy as np
 
-from audio import parse_time, detect_beats, analyze_audio_features, compute_energy_envelope
+from audio import parse_time, detect_beats, analyze_audio_features, compute_energy_envelope, detect_direction_flips
 from detection import prescan_person_positions, analyze_video_motion
 from timeline import build_video_meta, build_timeline
 from render import (
@@ -16,6 +16,7 @@ RESOLUTION_PRESETS = {
     "1080p Square (1080×1080)": (1080, 1080),
     "1080p Vertical (1080×1920)": (1080, 1920),
     "1080p Landscape (1920×1080)": (1920, 1080),
+    "720p Landscape (1280×720)": (1280, 720),
 }
 
 FPS_PRESETS = {
@@ -67,21 +68,31 @@ def calculate_optimal_parameters(audio_features, motion_scores):
     source_stride = min(8, max(1, base_stride))
     reasoning.append(f"BPM {bpm:.0f} + beat strength {beat_strength:.2f} → source_stride={source_stride}")
 
-    # Motion speed
+    # Master speed (scaled proportionately to maintain absolute motion speed)
+    # We want a final speed multiplier of 0.5 - 1.2
+    # But stride and repeat affect this, so we compensate.
+    
     if avg_motion < 0.3:
-        motion_speed = 1.2
-        reasoning.append(f"Low video motion ({avg_motion:.2f}) → motion_speed=1.2")
+        target_speed = 1.1
+        reasoning.append(f"Low video motion ({avg_motion:.2f}) → target_speed=1.1")
     elif avg_motion < 0.6:
-        motion_speed = 0.8
-        reasoning.append(f"Medium video motion ({avg_motion:.2f}) → motion_speed=0.8")
+        target_speed = 0.8
+        reasoning.append(f"Medium video motion ({avg_motion:.2f}) → target_speed=0.8")
     else:
-        motion_speed = 0.5
-        reasoning.append(f"High video motion ({avg_motion:.2f}) → motion_speed=0.5")
+        target_speed = 0.5
+        reasoning.append(f"High video motion ({avg_motion:.2f}) → target_speed=0.5")
 
     if tempo_cat in ("fast", "very_fast"):
-        motion_speed *= 1.2
-        reasoning.append(f"Fast song → motion_speed adjusted to {motion_speed:.2f}")
-    motion_speed = round(min(2.0, max(0.05, motion_speed)), 2)
+        target_speed *= 1.1
+        reasoning.append(f"Fast song → target_speed boosted to {target_speed:.2f}")
+
+    # motion_speed is what we'll call 'speed_scale' in timeline.py
+    # Since advance = (speed_scale * stride * repeat), we need:
+    # target_speed = speed_scale * stride
+    # so: speed_scale = target_speed / stride
+    motion_speed = round(target_speed / source_stride, 3)
+    motion_speed = max(0.05, min(2.0, motion_speed))
+    reasoning.append(f"Final speed_scale={motion_speed} (to normalize for stride {source_stride})")
 
     # Zoom
     if energy < 0.3:
@@ -133,10 +144,17 @@ def generate_beat_sync_video(
     speed_ramp=0.0,
     step_print=0.0,
     speed_curve="None",
+    audio_tempo_factor=1.0,
+    status_cb=None,
     progress=None,
 ):
+    def notify(fn_name, message):
+        if status_cb:
+            status_cb(fn_name, message)
+
     if progress:
         progress(0.0, desc="Initializing...")
+    notify("generate.generate_beat_sync_video", "Initializing pipeline")
 
     reset_cancel()
 
@@ -157,19 +175,23 @@ def generate_beat_sync_video(
     # Beat detection with librosa
     if progress:
         progress(0.08, desc="Analyzing beats (librosa)...")
+    notify("audio.detect_beats", "Analyzing beats")
     beat_set = detect_beats(audio_file, start_time, duration_seconds, render_fps)
+    direction_flip_set = detect_direction_flips(audio_file, start_time, duration_seconds, render_fps)
 
     # Energy envelope for speed ramping
     energy_envelope = None
     if speed_ramp > 0:
         if progress:
             progress(0.12, desc="Computing energy envelope...")
+        notify("audio.compute_energy_envelope", "Computing energy envelope")
         energy_envelope = compute_energy_envelope(
             audio_file, start_time, duration_seconds, render_fps
         )
 
     if progress:
         progress(0.2, desc="Indexing videos...")
+    notify("timeline.build_video_meta", "Indexing source videos")
     video_meta = build_video_meta(video_files)
 
     if not any(m["total"] > 0 for m in video_meta):
@@ -180,10 +202,12 @@ def generate_beat_sync_video(
     if crop_mode == "person":
         if progress:
             progress(0.30, desc="Detecting subjects (YOLO)...")
+        notify("detection.prescan_person_positions", "Pre-scanning subjects with YOLO")
         person_cache = prescan_person_positions(video_files)
 
     if progress:
         progress(0.40, desc="Building timeline...")
+    notify("timeline.build_timeline", "Building beat-synced timeline")
 
     total_output_frames = int(duration_seconds * render_fps)
     path = build_timeline(
@@ -193,6 +217,7 @@ def generate_beat_sync_video(
         energy_envelope=energy_envelope,
         ramp_intensity=speed_ramp,
         speed_curve=speed_curve,
+        direction_flip_set=direction_flip_set,
     )
 
     if is_cancelled():
@@ -201,16 +226,19 @@ def generate_beat_sync_video(
     # Render
     if progress:
         progress(0.55, desc="Rendering video...")
+    notify("render.render_video", "Rendering output frames")
     raw_path, frame_usage, timestamp = render_video(
         path, video_files, person_cache, crop_mode, zoom,
         width, height, render_fps, noise_intensity, output_dir, progress,
         step_print_intensity=step_print,
+        status_cb=status_cb,
     )
 
     # 60fps interpolation
     if do_interpolate:
         if progress:
             progress(0.88, desc="Interpolating to 60fps...")
+        notify("render.interpolate_60fps", "Interpolating 30fps to 60fps")
         interp_path = os.path.join(output_dir, f"interp_{timestamp}.mp4")
         try:
             interpolate_60fps(raw_path, interp_path)
@@ -222,6 +250,7 @@ def generate_beat_sync_video(
     # Mux audio
     if progress:
         progress(0.92, desc="Merging audio...")
+    notify("render.ffmpeg_mux_audio", "Muxing audio with rendered video")
 
     final_stats = {
         "total_scenes": len(video_files),
@@ -252,6 +281,7 @@ def generate_beat_sync_video(
             "speed_ramp": speed_ramp,
             "step_print": step_print,
             "speed_curve": speed_curve,
+            "audio_tempo_factor": audio_tempo_factor,
         },
         "stats": final_stats,
     }
@@ -263,6 +293,7 @@ def generate_beat_sync_video(
             start_time=start_time,
             duration_seconds=duration_seconds,
             final_output_path=final_output_path,
+            tempo_factor=audio_tempo_factor,
         )
         # Clean up raw/interp file after successful mux
         if os.path.exists(raw_path) and raw_path != final_output_path:
@@ -270,6 +301,7 @@ def generate_beat_sync_video(
 
         if progress:
             progress(1.0, desc="Done!")
+        notify("generate.generate_beat_sync_video", "Generation complete")
 
         log_payload["output_video"] = final_output_path
         log_payload["status"] = "success"

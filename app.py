@@ -1,5 +1,9 @@
 import gradio as gr
 import os
+import time
+import queue
+import threading
+import datetime
 from generate import (
     generate_beat_sync_video, analyze_and_recommend_settings,
     RESOLUTION_PRESETS, FPS_PRESETS,
@@ -9,53 +13,134 @@ from render import cancel_generation
 
 
 FIXED_SPEED_RAMP = 1.0
+DEFAULT_MUSIC_DIR = "/Users/aswinharidas/Downloads/Music"
+SUPPORTED_AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
+
+
+def list_music_files(folder):
+    if not folder or not os.path.isdir(folder):
+        return []
+    files = []
+    for root, _, names in os.walk(folder):
+        for name in names:
+            if name.lower().endswith(SUPPORTED_AUDIO_EXTS):
+                files.append(os.path.join(root, name))
+    return sorted(files)
+
+
+def refresh_music_choices(folder):
+    choices = list_music_files(folder)
+    value = choices[0] if choices else None
+    return gr.Dropdown(choices=choices, value=value)
+
+
+INITIAL_MUSIC_CHOICES = list_music_files(DEFAULT_MUSIC_DIR)
+
+
+def _format_live_status(lines):
+    body = "\n".join(lines[-14:]) if lines else "- Initializing..."
+    return "### ⚙️ Generating...\n" + body
 
 
 def run_generator(video_files, audio_file, start_time, duration,
                   noise_intensity, step_print, speed_curve,
-                  crop_mode, resolution, target_fps,
-                  progress=gr.Progress()):
+                  resolution, target_fps, music_file_path,
+                  crop_mode, progress=gr.Progress()):
     if not video_files:
-        return None, "Please upload videos."
-    if audio_file is None:
-        return None, "Please upload an audio file."
+        yield None, "Please upload videos."
+        return
+    chosen_audio = audio_file.name if audio_file is not None else music_file_path
+    if not chosen_audio:
+        yield None, "Please upload an audio file."
+        return
 
     video_paths = [v.name for v in video_files[:5]]
-    audio_path = audio_file.name
+    audio_path = chosen_audio
     safe_duration = max(5, min(float(duration), 45.0))
 
-    crop_key = {"Center": "center", "Content Aware": "content",
-                "Person Tracking (YOLO)": "person"}.get(crop_mode, "center")
+    crop_key = "center"
+    if "Person" in crop_mode:
+        crop_key = "person"
+    elif "Content" in crop_mode:
+        crop_key = "content"
+
+
+    status_q = queue.Queue()
+    status_lines = []
+    result = {"output_video": None, "stats": None, "recs": None, "error": None}
+    done = threading.Event()
+
+    def push_status(fn_name, text):
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        status_q.put(f"- `{fn_name}`: {text} (`{stamp}`)")
+
+    def worker():
+        try:
+            push_status("generate.analyze_and_recommend_settings", "Analyzing audio + source motion")
+            recs = analyze_and_recommend_settings(video_paths, audio_path,
+                                                  start_time, safe_duration)
+
+            zoom = recs['zoom']
+            motion_speed = recs['motion_speed']
+            step_repeat = recs['step_repeat']
+            source_stride = recs['source_stride']
+            audio_tempo_factor = recs['audio_analysis'].get('audio_tempo_factor', 1.0)
+
+            output_video, stats = generate_beat_sync_video(
+                video_files=video_paths,
+                audio_file=audio_path,
+                start_time_str=start_time,
+                clip_duration=safe_duration,
+                zoom=zoom,
+                motion_speed=motion_speed,
+                step_repeat=step_repeat,
+                source_stride=source_stride,
+                noise_intensity=noise_intensity,
+                crop_mode=crop_key,
+                resolution=resolution,
+                target_fps=target_fps,
+                speed_ramp=FIXED_SPEED_RAMP,
+                step_print=step_print,
+                speed_curve=speed_curve,
+                audio_tempo_factor=audio_tempo_factor,
+                status_cb=push_status,
+                progress=None,
+            )
+
+            result["recs"] = recs
+            result["output_video"] = output_video
+            result["stats"] = stats
+        except Exception as e:
+            result["error"] = e
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    yield None, _format_live_status(status_lines)
+
+    while not done.is_set() or not status_q.empty():
+        updated = False
+        while not status_q.empty():
+            status_lines.append(status_q.get())
+            updated = True
+        if updated:
+            yield None, _format_live_status(status_lines)
+        time.sleep(0.2)
 
     try:
-        if progress:
-            progress(0.0, desc="Auto-calculating parameters...")
-        recs = analyze_and_recommend_settings(video_paths, audio_path,
-                                              start_time, safe_duration)
+        if result["error"] is not None:
+            raise result["error"]
+
+        recs = result["recs"]
+        output_video = result["output_video"]
+        stats = result["stats"]
 
         zoom = recs['zoom']
         motion_speed = recs['motion_speed']
         step_repeat = recs['step_repeat']
         source_stride = recs['source_stride']
-
-        output_video, stats = generate_beat_sync_video(
-            video_files=video_paths,
-            audio_file=audio_path,
-            start_time_str=start_time,
-            clip_duration=safe_duration,
-            zoom=zoom,
-            motion_speed=motion_speed,
-            step_repeat=step_repeat,
-            source_stride=source_stride,
-            noise_intensity=noise_intensity,
-            crop_mode=crop_key,
-            resolution=resolution,
-            target_fps=target_fps,
-            speed_ramp=FIXED_SPEED_RAMP,
-            step_print=step_print,
-            speed_curve=speed_curve,
-            progress=progress,
-        )
+        audio_tempo_factor = recs['audio_analysis'].get('audio_tempo_factor', 1.0)
 
         w, h = RESOLUTION_PRESETS.get(resolution, (720, 720))
         fps_val = FPS_PRESETS.get(target_fps, 30)
@@ -69,6 +154,10 @@ def run_generator(video_files, audio_file, start_time, duration,
         msg += f"- **Audio:** BPM={analysis['bpm']}, "
         msg += f"Energy={analysis['energy']}, "
         msg += f"Tempo={analysis['tempo_category']}\n"
+        if 'raw_bpm' in analysis and analysis['raw_bpm'] != analysis['bpm']:
+            msg += f"- **BPM normalized:** raw={analysis['raw_bpm']} → used={analysis['bpm']}\n"
+        if abs(float(audio_tempo_factor) - 1.0) > 1e-6:
+            msg += f"- **Audio tempo factor:** {audio_tempo_factor}x\n"
         msg += f"- **Scenes:** {stats['total_scenes']} | "
         msg += f"**Frames Indexed:** {stats['total_frames_indexed']}\n\n"
         msg += "#### 📊 Video Usage:\n"
@@ -76,15 +165,24 @@ def run_generator(video_files, audio_file, start_time, duration,
         sorted_usage = sorted(stats['video_usage_seconds'].items(),
                               key=lambda x: x[1], reverse=True)
         for name, secs in sorted_usage:
-            msg += f"- `{name}`: {secs}s\n" if secs > 0 else \
-                   f"- `{name}`: Not used\n"
+            # Clean up Gradio/tmp filenames
+            clean_name = name.split('/')[-1]
+            if clean_name.count('_') > 4:
+                # Likely a temp name like _._d.e.v.u_.__173...
+                # Try to find the original-ish part
+                parts = clean_name.split('_')
+                if len(parts) > 2:
+                    clean_name = "_".join(parts[:-2])[:30] + "..." + parts[-1][-4:]
+            
+            msg += f"- `{clean_name}`: {secs}s\n" if secs > 0 else \
+                   f"- `{clean_name}`: Not used\n"
 
-        return output_video, msg
+        yield output_video, msg
 
     except InterruptedError:
-        return None, "### ⏹ Generation cancelled."
+        yield None, "### ⏹ Generation cancelled."
     except Exception as e:
-        return None, f"Error: {e}"
+        yield None, f"Error: {e}"
 
 
 def stop_generation():
@@ -108,6 +206,18 @@ with gr.Blocks() as demo:
         with gr.Column(scale=1):
             video_input = gr.File(label="Videos", file_count="multiple")
             audio_input = gr.File(label="Audio", file_types=["audio"])
+            music_dir_input = gr.Textbox(
+                label="Music Folder",
+                value=DEFAULT_MUSIC_DIR,
+                info="Pick audio directly from this folder",
+            )
+            with gr.Row():
+                music_file_input = gr.Dropdown(
+                    label="Music Library",
+                    choices=INITIAL_MUSIC_CHOICES,
+                    value=INITIAL_MUSIC_CHOICES[0] if INITIAL_MUSIC_CHOICES else None,
+                )
+                refresh_music_btn = gr.Button("Refresh")
 
             with gr.Row():
                 start_time_input = gr.Textbox(label="Start", value="00:00")
@@ -117,12 +227,12 @@ with gr.Blocks() as demo:
                 resolution_input = gr.Dropdown(
                     label="Resolution",
                     choices=list(RESOLUTION_PRESETS.keys()),
-                    value="720p Square (720×720)",
+                    value="1080p Square (1080×1080)",
                 )
                 fps_input = gr.Dropdown(
                     label="FPS",
                     choices=list(FPS_PRESETS.keys()),
-                    value="30 fps (Default)",
+                    value="60 fps (Interpolated)",
                 )
 
             with gr.Row():
@@ -134,6 +244,13 @@ with gr.Blocks() as demo:
                     info="Low shutter / motion trail effect (0=off, 1=max)"
                 )
 
+            crop_mode_input = gr.Dropdown(
+                label="Crop Mode",
+                choices=["Center", "Person/Car (YOLO)", "Content-Aware"],
+                value="Person/Car (YOLO)",
+                info="Smart tracking for person/car, or content-aware (faster)",
+            )
+
             speed_curve_input = gr.Dropdown(
                 label="Speed Curve",
                 choices=list(SPEED_CURVES.keys()),
@@ -141,28 +258,45 @@ with gr.Blocks() as demo:
                 info="Controls playback speed over the clip duration",
             )
 
-            crop_mode_input = gr.Radio(
-                label="Crop Mode",
-                choices=["Center", "Content Aware", "Person Tracking (YOLO)"],
-                value="Center",
-            )
-
             with gr.Row():
                 generate_btn = gr.Button("▶ Generate", variant="primary",
                                          elem_id="generate_btn")
+                aesthetic_btn = gr.Button("✨ Aesthetic Slow-Mo", elem_id="auto_calc_btn")
                 cancel_btn = gr.Button("⏹ Stop", elem_id="cancel_btn")
 
         with gr.Column(scale=2):
             video_output = gr.Video(label=None)
             status_output = gr.Markdown("### 🕒 Waiting for Input...")
 
+    def apply_aesthetic_preset():
+        return [
+            "1080p Square (1080×1080)",
+            "60 fps (Interpolated)",
+            0.08,
+            0.55,
+            "⏩ Fast → Slow → Fast",
+            "Person/Car (YOLO)"
+        ]
+
+    aesthetic_btn.click(
+        fn=apply_aesthetic_preset,
+        outputs=[resolution_input, fps_input, noise_intensity_input, 
+                 step_print_input, speed_curve_input, crop_mode_input]
+    )
+
     # Generate
     gen_event = generate_btn.click(
         fn=run_generator,
         inputs=[video_input, audio_input, start_time_input, duration_input,
                 noise_intensity_input, step_print_input, speed_curve_input,
-                crop_mode_input, resolution_input, fps_input],
+                resolution_input, fps_input, music_file_input, crop_mode_input],
         outputs=[video_output, status_output],
+    )
+
+    refresh_music_btn.click(
+        fn=refresh_music_choices,
+        inputs=[music_dir_input],
+        outputs=[music_file_input],
     )
 
     # Cancel

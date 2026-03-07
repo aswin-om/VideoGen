@@ -68,13 +68,9 @@ def build_video_meta(video_files):
 def build_timeline(video_files, video_meta, beat_set, total_output_frames,
                    motion_speed, step_repeat, source_stride, fps,
                    person_cache=None, energy_envelope=None, ramp_intensity=0.0,
-                   speed_curve="None"):
+                   speed_curve="None", direction_flip_set=None):
     """
-    Build frame-by-frame timeline.
-    Uses YOLO detection density for smart clip selection when person_cache is provided.
-    When energy_envelope and ramp_intensity > 0, applies speed ramping:
-      quiet → slow-mo (1/φ ≈ 0.618×), loud → fast (φ ≈ 1.618×).
-    speed_curve selects a preset speed graph applied on top of everything.
+    Build frame-by-frame timeline with intelligent direction flipping.
     """
     path = []
     active_vid = 0
@@ -89,42 +85,67 @@ def build_timeline(video_files, video_meta, beat_set, total_output_frames,
     stride_count = max(1, int(source_stride))
     frames_since_switch = 0
     min_shot_len = 10
+    
+    # 1 = Forward, -1 = Reverse
+    direction = 1.0
+    direction_flip_set = direction_flip_set or set()
 
     curve_fn = SPEED_CURVES.get(speed_curve, _curve_none)
     curve_mults = curve_fn(total_output_frames)
 
     for i in range(total_output_frames):
+        # Direction Toggle (Onsets / Drops)
+        if i in direction_flip_set and frames_since_switch > 15:
+            direction *= -1.0
+            # Small random jump when flipping to add energy
+            source_positions[active_vid] += direction * (fps * 0.5)
+
         # Beat-triggered switch
         if i in beat_set and frames_since_switch >= min_shot_len and len(video_files) > 1:
             active_vid = _pick_best_video(
                 active_vid, video_files, video_meta, source_positions, person_cache
             )
             frames_since_switch = 0
+            # Reset direction to forward on clip switch for coherence
+            direction = 1.0
 
-        # End-of-clip switch
+        # End-of-clip switch (or start-of-clip if reversed)
         curr_total = video_meta[active_vid]["total"]
-        if source_positions[active_vid] >= max(0, curr_total - 1) and len(video_files) > 1:
+        pos = source_positions[active_vid]
+        if (pos >= max(0, curr_total - 1) or pos <= 0) and len(video_files) > 1:
             for shift in range(1, len(video_files) + 1):
                 cand = (active_vid + shift) % len(video_files)
                 if (video_meta[cand]["total"] > 0 and
-                        source_positions[cand] < max(0, video_meta[cand]["total"] - 1)):
+                        0 < source_positions[cand] < max(0, video_meta[cand]["total"] - 1)):
                     active_vid = cand
                     frames_since_switch = 0
+                    direction = 1.0
                     break
 
         curr_total = video_meta[active_vid]["total"]
         curr_fps = video_meta[active_vid]["fps"]
         frame_idx = int(min(max(0, curr_total - 1), round(source_positions[active_vid])))
 
-        # Speed ramping: φ^((2e-1) * intensity) + preset curve
+        # Absolute speed calculation:
+        # We want the source to play at 'speed_scale' relative to real-time.
+        # 'curr_fps / fps' normalizes for source vs output frame rate differences.
+        # We multiply by 'repeat_count' because we only advance every 'repeat_count' frames.
+        # 'stride_count' is used here to ensure we move at least that many frames if requested,
+        # but we prioritize the target speed_scale.
+        
         ramp_mult = _speed_multiplier(energy_envelope, i, ramp_intensity)
         curve_mult = float(curve_mults[i])
-        advance = max(0.25, (curr_fps / fps) * speed_scale * ramp_mult * curve_mult)
+        
+        # The base amount of source frames to advance per output frame to hit target speed
+        target_advance_per_frame = (curr_fps / fps) * speed_scale * ramp_mult * curve_mult
+        
+        # When we DO advance (every repeat_count frames), we move this much:
+        advance = target_advance_per_frame * repeat_count * stride_count * direction
 
         if (i + 1) % repeat_count == 0:
             source_positions[active_vid] = min(
                 max(0, curr_total - 1),
-                source_positions[active_vid] + (advance * stride_count)
+                max(0, source_positions[active_vid] + advance)
             )
         path.append((video_files[active_vid], frame_idx, active_vid))
         frames_since_switch += 1

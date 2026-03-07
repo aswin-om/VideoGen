@@ -2,6 +2,9 @@ import subprocess
 import numpy as np
 import librosa
 
+BPM_MIN = 60.0
+BPM_MAX = 140.0
+
 
 def parse_time(time_str):
     if isinstance(time_str, (int, float)):
@@ -45,7 +48,8 @@ def analyze_audio_features(audio_file, start_time, duration_seconds):
             return _default_features()
 
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        bpm = float(tempo)
+        raw_bpm = float(tempo)
+        bpm, tempo_factor, bpm_note = normalize_bpm(raw_bpm)
 
         rms = librosa.feature.rms(y=y)[0]
         energy = min(1.0, float(np.mean(rms)) * 5)
@@ -64,9 +68,12 @@ def analyze_audio_features(audio_file, start_time, duration_seconds):
 
         return {
             "bpm": round(bpm, 1),
+            "raw_bpm": round(raw_bpm, 1),
             "energy": round(energy, 2),
             "beat_strength": round(beat_strength, 2),
             "tempo_category": tempo_category,
+            "audio_tempo_factor": round(tempo_factor, 3),
+            "bpm_note": bpm_note,
         }
 
     except Exception as e:
@@ -75,7 +82,81 @@ def analyze_audio_features(audio_file, start_time, duration_seconds):
 
 
 def _default_features():
-    return {"bpm": 120, "energy": 0.5, "beat_strength": 0.5, "tempo_category": "medium"}
+    return {
+        "bpm": 120,
+        "raw_bpm": 120,
+        "energy": 0.5,
+        "beat_strength": 0.5,
+        "tempo_category": "medium",
+        "audio_tempo_factor": 1.0,
+        "bpm_note": "default_fallback",
+    }
+
+
+def normalize_bpm(raw_bpm):
+    """
+    Normalize BPM into the 60-140 window.
+    - If BPM is too fast, keep halving while possible.
+    - If a further halving would drop below 60, keep BPM at 60 and
+      flag an audio slowdown factor for final mux.
+    Returns: (normalized_bpm, audio_tempo_factor, note)
+    """
+    bpm = float(max(0.0, raw_bpm))
+    tempo_factor = 1.0
+
+    if bpm <= 0:
+        return 120.0, 1.0, "invalid_bpm_fallback"
+
+    if bpm <= BPM_MAX and bpm >= BPM_MIN:
+        return bpm, 1.0, "in_range"
+
+    if bpm > BPM_MAX:
+        while bpm > BPM_MAX:
+            halved = bpm / 2.0
+            if halved < BPM_MIN:
+                tempo_factor = BPM_MIN / bpm
+                return BPM_MIN, tempo_factor, "too_fast_slowed_audio"
+            bpm = halved
+        return bpm, 1.0, "too_fast_halved"
+
+    # For very slow tracks, clamp to minimum analysis BPM.
+    return BPM_MIN, 1.0, "too_slow_clamped"
+
+
+def detect_direction_flips(audio_file, start_time, duration_seconds, fps):
+    """
+    Identify regions where video playback direction should flip (Forward/Reverse).
+    Triggered by high onset strength peaks (drum fills, drops, etc.).
+    Returns a set of frame indices where direction should toggle.
+    """
+    total_frames = int(duration_seconds * fps)
+    try:
+        y, sr = librosa.load(audio_file, sr=22050, offset=start_time,
+                             duration=duration_seconds, mono=True)
+        if len(y) < sr * 0.1:
+            return set()
+
+        # onset_strength captures high energy changes
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        # Use a higher threshold for direction flips than normal beats
+        peaks = librosa.util.peak_pick(onset_env, pre_max=7, post_max=7, pre_avg=7, post_avg=7, delta=0.5, wait=15)
+        
+        peak_times = librosa.frames_to_time(peaks, sr=sr)
+        # Only flip every ~2 seconds at most to avoid headache
+        flip_frames = sorted([int(round(t * fps)) for t in peak_times])
+        
+        safe_flips = set()
+        last_flip = -100
+        min_gap = int(fps * 1.5)
+        
+        for f in flip_frames:
+            if 0 <= f < total_frames and (f - last_flip) >= min_gap:
+                safe_flips.add(f)
+                last_flip = f
+                
+        return safe_flips
+    except Exception:
+        return set()
 
 
 def compute_energy_envelope(audio_file, start_time, duration_seconds, fps):

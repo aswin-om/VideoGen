@@ -104,49 +104,56 @@ def _detect_eyes_in_roi(person_roi, face_cascade, eye_cascade):
     return (fx + fw // 2, fy + fh // 3)
 
 
-def analyze_video_motion(video_files, max_samples=30):
-    """Measure motion intensity per video using optical flow."""
+def analyze_video_motion(video_files, max_samples=25):
+    """
+    Measure motion intensity per video using fast frame differencing.
+    Optimized for CPU/M2 by avoiding Farneback optical flow.
+    """
     motion_scores = {}
-
     for v_path in video_files:
         try:
             cap = cv2.VideoCapture(v_path)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
             if total_frames < 2:
                 motion_scores[v_path] = 0.0
                 cap.release()
                 continue
 
-            sample_indices = np.linspace(0, total_frames - 2,
+            # Sample fewer frames for faster analysis
+            sample_indices = np.linspace(0, total_frames - 2, 
                                          min(max_samples, total_frames - 1), dtype=int)
             motion_values = []
-            prev_gray = None
+            
+            # Pre-read first frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(sample_indices[0]))
+            ret, prev_frame = cap.read()
+            if not ret:
+                motion_scores[v_path] = 0.5
+                cap.release()
+                continue
+            
+            # Downscale and gray for speed
+            prev_gray = cv2.cvtColor(cv2.resize(prev_frame, (160, 120)), cv2.COLOR_BGR2GRAY)
 
-            for idx in sample_indices:
+            for idx in sample_indices[1:]:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
                 ret, frame = cap.read()
                 if not ret:
-                    continue
-
-                frame = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_LINEAR)
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-                if prev_gray is not None:
-                    flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
-                                                        0.5, 3, 15, 3, 5, 1.2, 0)
-                    magnitude = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
-                    motion_values.append(float(np.mean(magnitude)))
-
+                    break
+                
+                gray = cv2.cvtColor(cv2.resize(frame, (160, 120)), cv2.COLOR_BGR2GRAY)
+                # Use absolute difference - much faster than optical flow
+                diff = cv2.absdiff(prev_gray, gray)
+                motion_values.append(float(np.mean(diff)))
                 prev_gray = gray
 
             cap.release()
-
             if motion_values:
-                motion_scores[v_path] = round(min(1.0, np.mean(motion_values) / 3.0), 2)
+                # Normalize score to 0.0 - 1.0 range
+                avg_diff = np.mean(motion_values)
+                motion_scores[v_path] = round(min(1.0, avg_diff / 20.0), 2)
             else:
                 motion_scores[v_path] = 0.0
-
         except Exception as e:
             print(f"Video motion analysis error for {v_path}: {e}")
             motion_scores[v_path] = 0.5

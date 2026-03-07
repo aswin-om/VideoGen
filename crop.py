@@ -15,8 +15,8 @@ def _apply_zoom(cropped, zoom):
     return cropped[y:y + new_h, x:x + new_w]
 
 
-def center_crop(frame, target_w, target_h, zoom=1.0):
-    """Crop frame to target aspect ratio from center."""
+def get_crop_window(frame, pos, target_w, target_h):
+    """Calculate the crop window (x, y, w, h) centered on pos with target aspect ratio."""
     h, w = frame.shape[:2]
     target_ratio = target_w / target_h
 
@@ -27,28 +27,11 @@ def center_crop(frame, target_w, target_h, zoom=1.0):
         crop_w = w
         crop_h = int(w / target_ratio)
 
-    x = (w - crop_w) // 2
-    y = (h - crop_h) // 2
-    cropped = frame[y:y + crop_h, x:x + crop_w]
-    return _apply_zoom(cropped, zoom)
-
-
-def subject_crop(frame, pos, target_w, target_h, zoom=1.0):
-    """Crop centered on a detected subject. Falls back to center_crop if pos is None."""
     if pos is None:
-        return center_crop(frame, target_w, target_h, zoom)
-
-    h, w = frame.shape[:2]
-    target_ratio = target_w / target_h
-
-    if w / h > target_ratio:
-        crop_h = h
-        crop_w = int(h * target_ratio)
+        cx, cy = w // 2, h // 2
     else:
-        crop_w = w
-        crop_h = int(w / target_ratio)
+        cx, cy = int(round(pos[0])), int(round(pos[1]))
 
-    cx, cy = int(round(pos[0])), int(round(pos[1]))
     half_w = crop_w // 2
     half_h = crop_h // 2
     cx = max(half_w, min(w - half_w, cx))
@@ -56,15 +39,32 @@ def subject_crop(frame, pos, target_w, target_h, zoom=1.0):
 
     x = cx - half_w
     y = cy - half_h
-    cropped = frame[y:y + crop_h, x:x + crop_w]
+    return x, y, crop_w, crop_h
+
+
+def center_crop(frame, target_w, target_h, zoom=1.0):
+    """Crop frame to target aspect ratio from center."""
+    x, y, w, h = get_crop_window(frame, None, target_w, target_h)
+    cropped = frame[y:y + h, x:x + w]
     return _apply_zoom(cropped, zoom)
 
 
-def content_aware_crop(frame, target_w, target_h, zoom=1.0):
-    """Crop based on edge-detection center of mass."""
-    h, w = frame.shape[:2]
+def subject_crop(frame, pos, target_w, target_h, zoom=1.0):
+    """Crop centered on a detected subject. Falls back to center_crop if pos is None."""
+    x, y, w, h = get_crop_window(frame, pos, target_w, target_h)
+    cropped = frame[y:y + h, x:x + w]
+    return _apply_zoom(cropped, zoom)
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+def get_content_center(frame):
+    """Calculate the edge-detection center of mass for the frame with downscaling optimization."""
+    h, w = frame.shape[:2]
+    # Downscale for much faster processing on CPU
+    scale = 0.5
+    sw, sh = int(w * scale), int(h * scale)
+    small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_NEAREST)
+    
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
     sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
     mag = np.sqrt(sobelx**2 + sobely**2)
@@ -73,9 +73,44 @@ def content_aware_crop(frame, target_w, target_h, zoom=1.0):
 
     M = cv2.moments(thresh)
     if M["m00"] > 0:
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-    else:
-        cx, cy = w // 2, h // 2
+        cx = (M["m10"] / M["m00"]) / scale
+        cy = (M["m01"] / M["m00"]) / scale
+        return cx, cy
+    return w // 2, h // 2
 
-    return subject_crop(frame, (cx, cy), target_w, target_h, zoom)
+
+def content_aware_crop(frame, target_w, target_h, zoom=1.0):
+    """Crop based on edge-detection center of mass."""
+    pos = get_content_center(frame)
+    return subject_crop(frame, pos, target_w, target_h, zoom)
+
+
+class SmoothCropManager:
+    """Stateful cropper that smooths movement between frames to avoid jitter."""
+
+    def __init__(self, smoothing=0.12):
+        self.smoothing = float(smoothing)
+        self.current_pos = None
+        self.last_v_path = None
+
+    def process(self, frame, target_w, target_h, zoom, v_path, ideal_pos=None):
+        """
+        Calculate smoothed crop and apply it.
+        If ideal_pos is None, it defaults to frame center.
+        """
+        h, w = frame.shape[:2]
+        if ideal_pos is None:
+            ideal_pos = (w / 2, h / 2)
+
+        # Reset if video source changed to avoid drifting between clips
+        if v_path != self.last_v_path or self.current_pos is None:
+            self.current_pos = np.array(ideal_pos, dtype=np.float32)
+            self.last_v_path = v_path
+        else:
+            # Smoothly move current_pos toward ideal_pos
+            target = np.array(ideal_pos, dtype=np.float32)
+            self.current_pos += (target - self.current_pos) * self.smoothing
+
+        x, y, cw, ch = get_crop_window(frame, self.current_pos, target_w, target_h)
+        cropped = frame[y:y + ch, x:x + cw]
+        return _apply_zoom(cropped, zoom)
