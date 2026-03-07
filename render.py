@@ -43,30 +43,45 @@ def apply_noise_grain(frame, intensity=0.0):
 
 
 class StepPrinter:
-    """Low shutter / step printing effect (Travis Scott style).
+    """Low shutter / step printing with frame echo (Travis Scott style).
 
-    Blends the current frame with a decaying accumulator of previous frames,
-    producing ghostly motion trails.  ``intensity`` (0–1) controls the decay:
-    0 = no effect, 1 = maximum trailing.
+    Combines an exponential-decay accumulator with a ring buffer of past
+    frames (echo) for heavy ghosting and motion trails.
+    ``intensity`` (0-1): 0 = off, 1 = maximum trailing.
     """
 
     def __init__(self, intensity=0.0):
         self.intensity = float(intensity)
         self._acc = None
+        self._echo_len = max(1, int(4 + 8 * self.intensity))
+        self._echo_buf = []
 
     def process(self, frame):
         if self.intensity <= 0:
             return frame
 
         f32 = frame.astype(np.float32)
-        alpha = self.intensity * 0.85  # blend weight for the trail
 
+        # Accumulator trail with heavy decay
+        alpha = 0.6 + 0.35 * self.intensity
         if self._acc is None:
             self._acc = f32.copy()
         else:
             self._acc = alpha * self._acc + (1.0 - alpha) * f32
 
-        blended = 0.5 * f32 + 0.5 * self._acc
+        # Echo: ring buffer of past frames blended together
+        self._echo_buf.append(f32.copy())
+        if len(self._echo_buf) > self._echo_len:
+            self._echo_buf.pop(0)
+
+        echo = np.mean(self._echo_buf, axis=0)
+
+        # Mix current + accumulator trail + echo ghosts
+        w_curr = max(0.15, 0.55 - 0.35 * self.intensity)
+        w_acc = 0.25 + 0.25 * self.intensity
+        w_echo = 1.0 - w_curr - w_acc
+
+        blended = w_curr * f32 + w_acc * self._acc + w_echo * echo
         return np.clip(blended, 0, 255).astype(np.uint8)
 
 

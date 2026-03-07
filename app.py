@@ -4,45 +4,16 @@ from generate import (
     generate_beat_sync_video, analyze_and_recommend_settings,
     RESOLUTION_PRESETS, FPS_PRESETS,
 )
+from timeline import SPEED_CURVES
 from render import cancel_generation
 
 
-def auto_calculate_settings(video_files, audio_file, start_time, duration,
-                            progress=gr.Progress()):
-    if not video_files:
-        return 1.0, 0.8, 1, 1, "❌ Please upload videos first."
-    if audio_file is None:
-        return 1.0, 0.8, 1, 1, "❌ Please upload an audio file first."
-
-    video_paths = [v.name for v in video_files[:5]]
-    audio_path = audio_file.name
-    safe_duration = max(5, min(float(duration), 45.0))
-
-    try:
-        if progress:
-            progress(0.0, desc="Analyzing audio...")
-        recs = analyze_and_recommend_settings(video_paths, audio_path,
-                                              start_time, safe_duration)
-        msg = "### 🤖 AI Analysis Complete\n\n"
-        msg += f"**Audio:** BPM={recs['audio_analysis']['bpm']}, "
-        msg += f"Energy={recs['audio_analysis']['energy']}, "
-        msg += f"Beats={recs['audio_analysis']['beat_strength']}, "
-        msg += f"Tempo={recs['audio_analysis']['tempo_category']}\n\n"
-        msg += f"**Video Motion:** {recs['avg_video_motion']}\n\n"
-        msg += "**Reasoning:**\n"
-        for r in recs['reasoning']:
-            msg += f"- {r}\n"
-        msg += "\n✅ Sliders updated!"
-
-        return recs['zoom'], recs['motion_speed'], recs['step_repeat'], \
-            recs['source_stride'], msg
-    except Exception as e:
-        return 1.0, 0.8, 1, 1, f"❌ Analysis error: {e}"
+FIXED_SPEED_RAMP = 1.0
 
 
-def run_generator(video_files, audio_file, start_time, duration, zoom,
-                  motion_speed, step_repeat, source_stride, noise_intensity,
-                  crop_mode, resolution, target_fps, speed_ramp, step_print,
+def run_generator(video_files, audio_file, start_time, duration,
+                  noise_intensity, step_print, speed_curve,
+                  crop_mode, resolution, target_fps,
                   progress=gr.Progress()):
     if not video_files:
         return None, "Please upload videos."
@@ -53,11 +24,20 @@ def run_generator(video_files, audio_file, start_time, duration, zoom,
     audio_path = audio_file.name
     safe_duration = max(5, min(float(duration), 45.0))
 
-    # Map UI crop mode label to internal key
     crop_key = {"Center": "center", "Content Aware": "content",
                 "Person Tracking (YOLO)": "person"}.get(crop_mode, "center")
 
     try:
+        if progress:
+            progress(0.0, desc="Auto-calculating parameters...")
+        recs = analyze_and_recommend_settings(video_paths, audio_path,
+                                              start_time, safe_duration)
+
+        zoom = recs['zoom']
+        motion_speed = recs['motion_speed']
+        step_repeat = recs['step_repeat']
+        source_stride = recs['source_stride']
+
         output_video, stats = generate_beat_sync_video(
             video_files=video_paths,
             audio_file=audio_path,
@@ -71,18 +51,24 @@ def run_generator(video_files, audio_file, start_time, duration, zoom,
             crop_mode=crop_key,
             resolution=resolution,
             target_fps=target_fps,
-            speed_ramp=speed_ramp,
+            speed_ramp=FIXED_SPEED_RAMP,
             step_print=step_print,
+            speed_curve=speed_curve,
             progress=progress,
         )
 
         w, h = RESOLUTION_PRESETS.get(resolution, (720, 720))
         fps_val = FPS_PRESETS.get(target_fps, 30)
 
+        analysis = recs['audio_analysis']
         msg = f"### ✅ Generation Complete\n"
         msg += f"- **Output:** {w}×{h} @ {fps_val}fps\n"
         msg += f"- **Duration:** {safe_duration}s\n"
-        msg += f"- **Settings:** repeat {int(step_repeat)}x, stride {int(source_stride)}\n"
+        msg += f"- **Auto params:** zoom={zoom}, speed={motion_speed}, "
+        msg += f"repeat={step_repeat}x, stride={source_stride}\n"
+        msg += f"- **Audio:** BPM={analysis['bpm']}, "
+        msg += f"Energy={analysis['energy']}, "
+        msg += f"Tempo={analysis['tempo_category']}\n"
         msg += f"- **Scenes:** {stats['total_scenes']} | "
         msg += f"**Frames Indexed:** {stats['total_frames_indexed']}\n\n"
         msg += "#### 📊 Video Usage:\n"
@@ -140,30 +126,21 @@ with gr.Blocks() as demo:
                 )
 
             with gr.Row():
-                zoom_input = gr.Slider(label="Zoom", minimum=1.0, maximum=1.5,
-                                       value=1.0, step=0.01)
-                speed_input = gr.Slider(label="Motion Speed", minimum=0.05,
-                                        maximum=2.0, value=0.8, step=0.05)
-
-            with gr.Row():
-                step_repeat_input = gr.Slider(label="Step Repeat", minimum=1,
-                                              maximum=8, value=1, step=1)
-                source_stride_input = gr.Slider(label="Source Stride", minimum=1,
-                                                maximum=8, value=1, step=1)
-
-            with gr.Row():
                 noise_intensity_input = gr.Slider(label="Noise", minimum=0.0,
-                                                  maximum=0.2, value=0.0, step=0.01)
-                speed_ramp_input = gr.Slider(
-                    label="Speed Ramp (φ)", minimum=0.0, maximum=1.0,
-                    value=0.0, step=0.05,
-                    info="0=off, 1=full (slow-mo ↔ fast via golden ratio)"
+                                                  maximum=0.2, value=0.07, step=0.01)
+                step_print_input = gr.Slider(
+                    label="Step Print", minimum=0.0, maximum=1.0,
+                    value=0.5, step=0.05,
+                    info="Low shutter / motion trail effect (0=off, 1=max)"
                 )
-            step_print_input = gr.Slider(
-                label="Step Print", minimum=0.0, maximum=1.0,
-                value=0.0, step=0.05,
-                info="Low shutter / motion trail effect (0=off, 1=max)"
+
+            speed_curve_input = gr.Dropdown(
+                label="Speed Curve",
+                choices=list(SPEED_CURVES.keys()),
+                value="⏩ Fast → Slow → Fast",
+                info="Controls playback speed over the clip duration",
             )
+
             crop_mode_input = gr.Radio(
                 label="Crop Mode",
                 choices=["Center", "Content Aware", "Person Tracking (YOLO)"],
@@ -171,8 +148,6 @@ with gr.Blocks() as demo:
             )
 
             with gr.Row():
-                auto_calc_btn = gr.Button("🤖 Auto-Calculate",
-                                          elem_id="auto_calc_btn")
                 generate_btn = gr.Button("▶ Generate", variant="primary",
                                          elem_id="generate_btn")
                 cancel_btn = gr.Button("⏹ Stop", elem_id="cancel_btn")
@@ -181,21 +156,12 @@ with gr.Blocks() as demo:
             video_output = gr.Video(label=None)
             status_output = gr.Markdown("### 🕒 Waiting for Input...")
 
-    # Auto-calculate
-    auto_calc_btn.click(
-        fn=auto_calculate_settings,
-        inputs=[video_input, audio_input, start_time_input, duration_input],
-        outputs=[zoom_input, speed_input, step_repeat_input,
-                 source_stride_input, status_output],
-    )
-
     # Generate
     gen_event = generate_btn.click(
         fn=run_generator,
         inputs=[video_input, audio_input, start_time_input, duration_input,
-                zoom_input, speed_input, step_repeat_input, source_stride_input,
-                noise_intensity_input, crop_mode_input, resolution_input,
-                fps_input, speed_ramp_input, step_print_input],
+                noise_intensity_input, step_print_input, speed_curve_input,
+                crop_mode_input, resolution_input, fps_input],
         outputs=[video_output, status_output],
     )
 

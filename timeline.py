@@ -4,6 +4,55 @@ import cv2
 PHI = 1.6180339887  # Golden ratio
 
 
+# ---------------------------------------------------------------------------
+# Speed-curve presets
+# Each function takes total_frames and returns an array of per-frame speed
+# multipliers (centred around 1.0).
+# ---------------------------------------------------------------------------
+
+def _curve_none(n):
+    return np.ones(n)
+
+
+def _curve_fast_slow_fast(n):
+    """Fast → slow → fast  (U-shape cosine)."""
+    t = np.linspace(0, 2 * np.pi, n)
+    # cos goes 1 → -1 → 1; remap to 2.0 → 0.4 → 2.0
+    return 0.4 + 1.6 * (0.5 + 0.5 * np.cos(t))
+
+
+def _curve_slow_fast_slow(n):
+    """Slow → fast → slow  (inverted U / ease-in-out)."""
+    t = np.linspace(0, 2 * np.pi, n)
+    return 0.4 + 1.6 * (0.5 - 0.5 * np.cos(t))
+
+
+def _curve_ramp_up(n):
+    """Gradually speed up over the clip."""
+    return np.linspace(0.4, 2.0, n)
+
+
+def _curve_ramp_down(n):
+    """Start fast, gradually slow down."""
+    return np.linspace(2.0, 0.4, n)
+
+
+def _curve_pulse(n):
+    """Periodic fast/slow pulses (3 cycles)."""
+    t = np.linspace(0, 6 * np.pi, n)
+    return 1.0 + 0.8 * np.sin(t)
+
+
+SPEED_CURVES = {
+    "None": _curve_none,
+    "⏩ Fast → Slow → Fast": _curve_fast_slow_fast,
+    "🐢 Slow → Fast → Slow": _curve_slow_fast_slow,
+    "📈 Ramp Up": _curve_ramp_up,
+    "📉 Ramp Down": _curve_ramp_down,
+    "💓 Pulse": _curve_pulse,
+}
+
+
 def build_video_meta(video_files):
     """Get frame count and FPS for each video."""
     meta = []
@@ -18,12 +67,14 @@ def build_video_meta(video_files):
 
 def build_timeline(video_files, video_meta, beat_set, total_output_frames,
                    motion_speed, step_repeat, source_stride, fps,
-                   person_cache=None, energy_envelope=None, ramp_intensity=0.0):
+                   person_cache=None, energy_envelope=None, ramp_intensity=0.0,
+                   speed_curve="None"):
     """
     Build frame-by-frame timeline.
     Uses YOLO detection density for smart clip selection when person_cache is provided.
     When energy_envelope and ramp_intensity > 0, applies speed ramping:
       quiet → slow-mo (1/φ ≈ 0.618×), loud → fast (φ ≈ 1.618×).
+    speed_curve selects a preset speed graph applied on top of everything.
     """
     path = []
     active_vid = 0
@@ -38,6 +89,9 @@ def build_timeline(video_files, video_meta, beat_set, total_output_frames,
     stride_count = max(1, int(source_stride))
     frames_since_switch = 0
     min_shot_len = 10
+
+    curve_fn = SPEED_CURVES.get(speed_curve, _curve_none)
+    curve_mults = curve_fn(total_output_frames)
 
     for i in range(total_output_frames):
         # Beat-triggered switch
@@ -62,9 +116,10 @@ def build_timeline(video_files, video_meta, beat_set, total_output_frames,
         curr_fps = video_meta[active_vid]["fps"]
         frame_idx = int(min(max(0, curr_total - 1), round(source_positions[active_vid])))
 
-        # Speed ramping: φ^((2e-1) * intensity)
+        # Speed ramping: φ^((2e-1) * intensity) + preset curve
         ramp_mult = _speed_multiplier(energy_envelope, i, ramp_intensity)
-        advance = max(0.25, (curr_fps / fps) * speed_scale * ramp_mult)
+        curve_mult = float(curve_mults[i])
+        advance = max(0.25, (curr_fps / fps) * speed_scale * ramp_mult * curve_mult)
 
         if (i + 1) % repeat_count == 0:
             source_positions[active_vid] = min(

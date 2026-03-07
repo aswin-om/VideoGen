@@ -132,6 +132,7 @@ def generate_beat_sync_video(
     target_fps="30 fps (Default)",
     speed_ramp=0.0,
     step_print=0.0,
+    speed_curve="None",
     progress=None,
 ):
     if progress:
@@ -191,6 +192,7 @@ def generate_beat_sync_video(
         person_cache=person_cache,
         energy_envelope=energy_envelope,
         ramp_intensity=speed_ramp,
+        speed_curve=speed_curve,
     )
 
     if is_cancelled():
@@ -249,6 +251,7 @@ def generate_beat_sync_video(
             "target_fps": target_fps,
             "speed_ramp": speed_ramp,
             "step_print": step_print,
+            "speed_curve": speed_curve,
         },
         "stats": final_stats,
     }
