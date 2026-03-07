@@ -116,7 +116,7 @@ def build_timeline(video_files, video_meta, beat_set, total_output_frames,
             for shift in range(1, len(video_files) + 1):
                 cand = (active_vid + shift) % len(video_files)
                 if (video_meta[cand]["total"] > 0 and
-                        0 < source_positions[cand] < max(0, video_meta[cand]["total"] - 1)):
+                        source_positions[cand] < max(0, video_meta[cand]["total"] - 1)):
                     active_vid = cand
                     frames_since_switch = 0
                     direction = 1.0
@@ -176,15 +176,16 @@ def _pick_best_video(current_vid, video_files, video_meta, source_positions,
     """
     Pick the best video to switch to.
     When person_cache is available, prefer clips with more detected subjects.
-    Falls back to round-robin otherwise.
+    Forces a switch to a different video if any other valid candidate exists.
     """
     if person_cache is None or len(video_files) <= 1:
         return _round_robin_next(current_vid, video_files, video_meta)
 
     best_score = -1.0
     best_cand = current_vid
-
-    for shift in range(1, len(video_files) + 1):
+    
+    # First, try to find the best candidate AMONG OTHER videos
+    for shift in range(1, len(video_files)):
         cand = (current_vid + shift) % len(video_files)
         total = video_meta[cand]["total"]
         if total <= 0:
@@ -204,12 +205,15 @@ def _pick_best_video(current_vid, video_files, video_meta, source_positions,
 
         # Variety bonus for less-used videos
         remaining_ratio = (total - src_pos) / max(1, total)
-        score += remaining_ratio * 0.1
+        score += remaining_ratio * 0.15
 
         if score > best_score:
             best_score = score
             best_cand = cand
 
+    # Only if no other video is valid, we might stay (but best_cand is already current_vid)
+    # However, if we found ANY other valid video, best_cand will be that video.
+    
     return best_cand
 
 

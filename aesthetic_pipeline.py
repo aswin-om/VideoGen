@@ -50,9 +50,9 @@ def main():
             crop_mode=args.crop_mode,
             resolution=args.resolution,
             target_fps=args.fps,
-            speed_ramp=0.5,           # Energy-based speed ramping
+            speed_ramp=0.0,           # Constant speed throughout
             step_print=args.intensity, # Motion trails (step printing)
-            speed_curve="⏩ Fast → Slow → Fast", # Cinematic aesthetic curve
+            speed_curve="None",       # Constant speed throughout
             status_cb=lambda fn, msg: print(f"[{fn}] {msg}"),
         )
         

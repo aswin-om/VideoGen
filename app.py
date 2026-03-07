@@ -12,34 +12,59 @@ from timeline import SPEED_CURVES
 from render import cancel_generation
 
 
-FIXED_SPEED_RAMP = 1.0
+FIXED_SPEED_RAMP = 0.0
 DEFAULT_MUSIC_DIR = "/Users/aswinharidas/Downloads/Music"
 SUPPORTED_AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
 
 
 def list_music_files(folder):
-    if not folder or not os.path.isdir(folder):
-        return []
+    root = folder if folder and os.path.isdir(folder) else DEFAULT_MUSIC_DIR
     files = []
-    for root, _, names in os.walk(folder):
-        for name in names:
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
             if name.lower().endswith(SUPPORTED_AUDIO_EXTS):
-                files.append(os.path.join(root, name))
+                files.append(os.path.join(dirpath, name))
     return sorted(files)
 
 
-def refresh_music_choices(folder):
-    choices = list_music_files(folder)
-    value = choices[0] if choices else None
-    return gr.Dropdown(choices=choices, value=value)
+def _song_label(path, base_folder):
+    rel = os.path.relpath(path, base_folder) if os.path.isdir(base_folder) else os.path.basename(path)
+    return rel
 
 
-INITIAL_MUSIC_CHOICES = list_music_files(DEFAULT_MUSIC_DIR)
+def refresh_music_choices():
+    files = list_music_files(DEFAULT_MUSIC_DIR)
+    choices = [(_song_label(p, DEFAULT_MUSIC_DIR), p) for p in files]
+    value = files[0] if files else None
+    status = (
+        f"Found {len(files)} songs in `{DEFAULT_MUSIC_DIR}`."
+        if files else
+        f"No songs found in `{DEFAULT_MUSIC_DIR}`."
+    )
+    preview = value if value else None
+    return gr.Dropdown(choices=choices, value=value), status, preview
+
+
+def on_song_selected(file_path):
+    if not file_path:
+        return "No song selected.", None
+    if not str(file_path).lower().endswith(SUPPORTED_AUDIO_EXTS):
+        return f"Selected file is not audio: `{os.path.basename(file_path)}`", None
+    return f"Selected: `{os.path.basename(file_path)}`", file_path
 
 
 def _format_live_status(lines):
-    body = "\n".join(lines[-14:]) if lines else "- Initializing..."
-    return "### ⚙️ Generating...\n" + body
+    if not lines:
+        return "### ⚙️ Generating...\n<div class='live-status-box'>Initializing...</div>"
+
+    latest = lines[-1]
+    recent = lines[-6:]
+    recent_html = "<br>".join(recent)
+    return (
+        "### ⚙️ Generating...\n"
+        f"**Current:** {latest}\n"
+        f"<div class='live-status-box'>{recent_html}</div>"
+    )
 
 
 def run_generator(video_files, audio_file, start_time, duration,
@@ -50,8 +75,10 @@ def run_generator(video_files, audio_file, start_time, duration,
         yield None, "Please upload videos."
         return
     chosen_audio = audio_file.name if audio_file is not None else music_file_path
+    if chosen_audio and not str(chosen_audio).lower().endswith(SUPPORTED_AUDIO_EXTS):
+        chosen_audio = None
     if not chosen_audio:
-        yield None, "Please upload an audio file."
+        yield None, "Please upload audio or pick a valid song from Songs."
         return
 
     video_paths = [v.name for v in video_files[:5]]
@@ -197,6 +224,18 @@ body, .gradio-container { background-color: #000000 !important; color: #a3a3a3 !
 #auto_calc_btn { background: #8b5cf6 !important; border: 1px solid #7c3aed !important; color: white !important; }
 #cancel_btn { background: #dc2626 !important; border: 1px solid #b91c1c !important; color: white !important; }
 .gr-input, .gr-box, input, textarea, select { background-color: #1a1a1a !important; border-color: #333333 !important; color: #d4d4d4 !important; border-radius: 4px !important; }
+.live-status-box {
+  margin-top: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid #333333;
+  border-radius: 8px;
+  padding: 10px;
+  background: #0f0f0f;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
 footer { display: none !important; }
 """
 
@@ -206,18 +245,16 @@ with gr.Blocks() as demo:
         with gr.Column(scale=1):
             video_input = gr.File(label="Videos", file_count="multiple")
             audio_input = gr.File(label="Audio", file_types=["audio"])
-            music_dir_input = gr.Textbox(
-                label="Music Folder",
-                value=DEFAULT_MUSIC_DIR,
-                info="Pick audio directly from this folder",
+            music_file_input = gr.Dropdown(
+                label="Songs",
+                choices=[],
+                value=None,
+                allow_custom_value=False,
+                filterable=True,
+                info=f"Loaded from {DEFAULT_MUSIC_DIR}",
             )
-            with gr.Row():
-                music_file_input = gr.Dropdown(
-                    label="Music Library",
-                    choices=INITIAL_MUSIC_CHOICES,
-                    value=INITIAL_MUSIC_CHOICES[0] if INITIAL_MUSIC_CHOICES else None,
-                )
-                refresh_music_btn = gr.Button("Refresh")
+            selected_song_text = gr.Markdown("Loading songs...")
+            selected_song_preview = gr.Audio(label="Selected Song Preview", interactive=False)
 
             with gr.Row():
                 start_time_input = gr.Textbox(label="Start", value="00:00")
@@ -251,13 +288,6 @@ with gr.Blocks() as demo:
                 info="Smart tracking for person/car, or content-aware (faster)",
             )
 
-            speed_curve_input = gr.Dropdown(
-                label="Speed Curve",
-                choices=list(SPEED_CURVES.keys()),
-                value="⏩ Fast → Slow → Fast",
-                info="Controls playback speed over the clip duration",
-            )
-
             with gr.Row():
                 generate_btn = gr.Button("▶ Generate", variant="primary",
                                          elem_id="generate_btn")
@@ -265,8 +295,9 @@ with gr.Blocks() as demo:
                 cancel_btn = gr.Button("⏹ Stop", elem_id="cancel_btn")
 
         with gr.Column(scale=2):
-            video_output = gr.Video(label=None)
+            video_output = gr.Video(label=None, height=420)
             status_output = gr.Markdown("### 🕒 Waiting for Input...")
+            copy_log_btn = gr.Button("Copy Output Log")
 
     def apply_aesthetic_preset():
         return [
@@ -274,29 +305,44 @@ with gr.Blocks() as demo:
             "60 fps (Interpolated)",
             0.08,
             0.55,
-            "⏩ Fast → Slow → Fast",
             "Person/Car (YOLO)"
         ]
 
     aesthetic_btn.click(
         fn=apply_aesthetic_preset,
         outputs=[resolution_input, fps_input, noise_intensity_input, 
-                 step_print_input, speed_curve_input, crop_mode_input]
+                 step_print_input, crop_mode_input]
     )
 
     # Generate
     gen_event = generate_btn.click(
         fn=run_generator,
         inputs=[video_input, audio_input, start_time_input, duration_input,
-                noise_intensity_input, step_print_input, speed_curve_input,
+                noise_intensity_input, step_print_input, gr.State("None"),
                 resolution_input, fps_input, music_file_input, crop_mode_input],
         outputs=[video_output, status_output],
     )
 
-    refresh_music_btn.click(
+    demo.load(
         fn=refresh_music_choices,
-        inputs=[music_dir_input],
-        outputs=[music_file_input],
+        outputs=[music_file_input, selected_song_text, selected_song_preview],
+    )
+    music_file_input.change(fn=on_song_selected, inputs=[music_file_input], outputs=[selected_song_text, selected_song_preview])
+
+    copy_log_btn.click(
+        fn=None,
+        inputs=[status_output],
+        outputs=None,
+        queue=False,
+        js="""
+        (logText) => {
+          const text = (logText || "").toString();
+          if (navigator?.clipboard?.writeText) {
+            navigator.clipboard.writeText(text);
+          }
+          return [];
+        }
+        """,
     )
 
     # Cancel
@@ -307,6 +353,7 @@ if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
+        allowed_paths=[DEFAULT_MUSIC_DIR],
         css=custom_css,
         theme=gr.themes.Base(primary_hue="orange", neutral_hue="neutral").set(
             body_background_fill="#000000",

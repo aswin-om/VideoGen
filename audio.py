@@ -123,6 +123,56 @@ def normalize_bpm(raw_bpm):
     return BPM_MIN, 1.0, "too_slow_clamped"
 
 
+def detect_multiband_switches(audio_file, start_time, duration_seconds, fps):
+    """
+    Analyzes bass (low-end) and high-frequency transients separately to find 
+    the most rhythmically impactful switch points.
+    """
+    try:
+        y, sr = librosa.load(audio_file, sr=22050, offset=start_time,
+                             duration=duration_seconds, mono=True)
+        if len(y) < sr * 0.1:
+            return set()
+
+        # 1. BASS ANALYSIS (Kick/Sub) - Focus on Mel bins < 200Hz
+        S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
+        bass_onset = librosa.onset.onset_strength(S=librosa.power_to_db(S[:15, :]), sr=sr)
+        # Relaxed delta from 1.5 to 1.1 for higher sensitivity
+        bass_peaks = librosa.util.peak_pick(bass_onset, pre_max=5, post_max=5, pre_avg=5, post_avg=5, delta=1.1, wait=10)
+        
+        # 2. HIGH FREQUENCY ANALYSIS (Snare/Percussion)
+        _, y_percussive = librosa.effects.hpss(y)
+        high_onset = librosa.onset.onset_strength(y=y_percussive, sr=sr)
+        # Relaxed delta from 2.0 to 1.4
+        high_peaks = librosa.util.peak_pick(high_onset, pre_max=3, post_max=3, pre_avg=3, post_avg=3, delta=1.4, wait=8)
+
+        bass_times = librosa.frames_to_time(bass_peaks, sr=sr)
+        high_times = librosa.frames_to_time(high_peaks, sr=sr)
+        
+        all_switches = sorted(list(set(bass_times) | set(high_times)))
+        
+        # Fallback: If we found very few multiband points, merge with regular beats
+        min_density = duration_seconds / 5.0 # At least one switch every 5s
+        if len(all_switches) < min_density:
+            tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+            beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+            all_switches = sorted(list(set(all_switches) | set(beat_times)))
+
+        min_gap = 0.4
+        filtered_switches = set()
+        last_t = -1.0
+        
+        for t in all_switches:
+            if 0 <= t < duration_seconds and (t - last_t) >= min_gap:
+                filtered_switches.add(int(round(t * fps)))
+                last_t = t
+                
+        return filtered_switches
+    except Exception as e:
+        print(f"Multiband detection error: {e}")
+        return set()
+
+
 def detect_direction_flips(audio_file, start_time, duration_seconds, fps):
     """
     Identify regions where video playback direction should flip (Forward/Reverse).

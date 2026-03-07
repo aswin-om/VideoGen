@@ -3,7 +3,10 @@ import json
 import datetime
 import numpy as np
 
-from audio import parse_time, detect_beats, analyze_audio_features, compute_energy_envelope, detect_direction_flips
+from audio import (
+    parse_time, detect_beats, analyze_audio_features, compute_energy_envelope, 
+    detect_direction_flips, detect_multiband_switches
+)
 from detection import prescan_person_positions, analyze_video_motion
 from timeline import build_video_meta, build_timeline
 from render import (
@@ -172,11 +175,11 @@ def generate_beat_sync_video(
     os.makedirs(output_dir, exist_ok=True)
     cleanup_old_generations(output_dir)
 
-    # Beat detection with librosa
+    # Multiband rhythmic switch detection
     if progress:
-        progress(0.08, desc="Analyzing beats (librosa)...")
-    notify("audio.detect_beats", "Analyzing beats")
-    beat_set = detect_beats(audio_file, start_time, duration_seconds, render_fps)
+        progress(0.08, desc="Multiband Audio Analysis (Bass/Highs)...")
+    notify("audio.detect_multiband_switches", "Analyzing rhythmic switch points")
+    beat_set = detect_multiband_switches(audio_file, start_time, duration_seconds, render_fps)
     direction_flip_set = detect_direction_flips(audio_file, start_time, duration_seconds, render_fps)
 
     # Energy envelope for speed ramping
