@@ -80,11 +80,12 @@ def build_timeline(video_files, video_meta, beat_set, total_output_frames,
         raise ValueError("No readable frames in uploaded videos.")
 
     source_positions = [0.0] * len(video_files)
+    usage_counts = [0] * len(video_files)
     speed_scale = max(0.25, float(motion_speed))
     repeat_count = max(1, int(step_repeat))
     stride_count = max(1, int(source_stride))
     frames_since_switch = 0
-    min_shot_len = 10
+    min_shot_len = 15 # Slightly longer minimum shot for stability
     
     # 1 = Forward, -1 = Reverse
     direction = 1.0
@@ -95,51 +96,47 @@ def build_timeline(video_files, video_meta, beat_set, total_output_frames,
 
     for i in range(total_output_frames):
         # Direction Toggle (Onsets / Drops)
-        if i in direction_flip_set and frames_since_switch > 15:
+        if i in direction_flip_set and frames_since_switch > 20:
             direction *= -1.0
             # Small random jump when flipping to add energy
-            source_positions[active_vid] += direction * (fps * 0.5)
+            source_positions[active_vid] = min(
+                max(0, video_meta[active_vid]["total"] - 1),
+                source_positions[active_vid] + direction * (fps * 0.3)
+            )
 
         # Beat-triggered switch
         if i in beat_set and frames_since_switch >= min_shot_len and len(video_files) > 1:
             active_vid = _pick_best_video(
-                active_vid, video_files, video_meta, source_positions, person_cache
+                active_vid, video_files, video_meta, source_positions, 
+                person_cache, usage_counts
             )
             frames_since_switch = 0
-            # Reset direction to forward on clip switch for coherence
             direction = 1.0
 
         # End-of-clip switch (or start-of-clip if reversed)
         curr_total = video_meta[active_vid]["total"]
         pos = source_positions[active_vid]
-        if (pos >= max(0, curr_total - 1) or pos <= 0) and len(video_files) > 1:
-            for shift in range(1, len(video_files) + 1):
-                cand = (active_vid + shift) % len(video_files)
-                if (video_meta[cand]["total"] > 0 and
-                        source_positions[cand] < max(0, video_meta[cand]["total"] - 1)):
-                    active_vid = cand
-                    frames_since_switch = 0
-                    direction = 1.0
-                    break
+        
+        # Only switch at pos <= 0 if we are moving backwards
+        at_end = pos >= max(0, curr_total - 1) and direction > 0
+        at_start = pos <= 0 and direction < 0
+        
+        if (at_end or at_start) and len(video_files) > 1:
+            active_vid = _pick_best_video(
+                active_vid, video_files, video_meta, source_positions, 
+                person_cache, usage_counts
+            )
+            frames_since_switch = 0
+            direction = 1.0
 
         curr_total = video_meta[active_vid]["total"]
         curr_fps = video_meta[active_vid]["fps"]
         frame_idx = int(min(max(0, curr_total - 1), round(source_positions[active_vid])))
 
-        # Absolute speed calculation:
-        # We want the source to play at 'speed_scale' relative to real-time.
-        # 'curr_fps / fps' normalizes for source vs output frame rate differences.
-        # We multiply by 'repeat_count' because we only advance every 'repeat_count' frames.
-        # 'stride_count' is used here to ensure we move at least that many frames if requested,
-        # but we prioritize the target speed_scale.
-        
+        # ... (rest of speed logic) ...
         ramp_mult = _speed_multiplier(energy_envelope, i, ramp_intensity)
         curve_mult = float(curve_mults[i])
-        
-        # The base amount of source frames to advance per output frame to hit target speed
         target_advance_per_frame = (curr_fps / fps) * speed_scale * ramp_mult * curve_mult
-        
-        # When we DO advance (every repeat_count frames), we move this much:
         advance = target_advance_per_frame * repeat_count * stride_count * direction
 
         if (i + 1) % repeat_count == 0:
@@ -148,6 +145,7 @@ def build_timeline(video_files, video_meta, beat_set, total_output_frames,
                 max(0, source_positions[active_vid] + advance)
             )
         path.append((video_files[active_vid], frame_idx, active_vid))
+        usage_counts[active_vid] += 1
         frames_since_switch += 1
 
     return path
@@ -172,18 +170,20 @@ def _speed_multiplier(energy_envelope, frame_idx, ramp_intensity):
 
 
 def _pick_best_video(current_vid, video_files, video_meta, source_positions,
-                     person_cache):
+                     person_cache, usage_counts):
     """
     Pick the best video to switch to.
     When person_cache is available, prefer clips with more detected subjects.
-    Forces a switch to a different video if any other valid candidate exists.
+    Uses usage_counts to force variety across all clips.
     """
-    if person_cache is None or len(video_files) <= 1:
-        return _round_robin_next(current_vid, video_files, video_meta)
+    if len(video_files) <= 1:
+        return current_vid
 
-    best_score = -1.0
+    best_score = -1e9
     best_cand = current_vid
     
+    total_usage = sum(usage_counts) + 1
+
     # First, try to find the best candidate AMONG OTHER videos
     for shift in range(1, len(video_files)):
         cand = (current_vid + shift) % len(video_files)
@@ -196,23 +196,29 @@ def _pick_best_video(current_vid, video_files, video_meta, source_positions,
             continue
 
         v_path = video_files[cand]
-        detections = person_cache.get(v_path, {})
+        detections = person_cache.get(v_path, {}) if person_cache else {}
 
-        # Detection density in the next 30 frames
-        window = min(30, total - src_pos)
+        # 1. Detection score (normalized 0-1)
+        window = 30
         hits = sum(1 for f in range(src_pos, src_pos + window) if f in detections)
-        score = hits / max(1, window)
+        detection_score = hits / window
 
-        # Variety bonus for less-used videos
+        # 2. Usage penalty (heavily penalize frequently used clips)
+        usage_ratio = usage_counts[cand] / total_usage
+        usage_penalty = usage_ratio * 5.0 # High penalty for repeats
+        
+        # 3. Variety bonus (favor clips with 0 usage)
+        variety_bonus = 2.0 if usage_counts[cand] == 0 else 0.0
+
+        # 4. Remaining content bonus
         remaining_ratio = (total - src_pos) / max(1, total)
-        score += remaining_ratio * 0.15
+        content_bonus = remaining_ratio * 0.5
+
+        score = detection_score - usage_penalty + variety_bonus + content_bonus
 
         if score > best_score:
             best_score = score
             best_cand = cand
-
-    # Only if no other video is valid, we might stay (but best_cand is already current_vid)
-    # However, if we found ANY other valid video, best_cand will be that video.
     
     return best_cand
 

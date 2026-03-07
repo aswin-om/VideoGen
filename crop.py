@@ -92,11 +92,11 @@ class SmoothCropManager:
         self.smoothing = float(smoothing)
         self.current_pos = None
         self.last_v_path = None
+        self.velocity_x = 0.0
 
     def process(self, frame, target_w, target_h, zoom, v_path, ideal_pos=None):
         """
-        Calculate smoothed crop and apply it.
-        If ideal_pos is None, it defaults to frame center.
+        Calculate smoothed crop with lead room and apply it.
         """
         h, w = frame.shape[:2]
         if ideal_pos is None:
@@ -106,9 +106,22 @@ class SmoothCropManager:
         if v_path != self.last_v_path or self.current_pos is None:
             self.current_pos = np.array(ideal_pos, dtype=np.float32)
             self.last_v_path = v_path
+            self.velocity_x = 0.0
         else:
-            # Smoothly move current_pos toward ideal_pos
+            # --- LEAD ROOM LOGIC ---
+            curr_v_x = ideal_pos[0] - self.current_pos[0]
+            # Smoothly track velocity
+            self.velocity_x = self.velocity_x * 0.9 + curr_v_x * 0.1
+            
+            # Offset current_pos in direction of velocity to provide lead room
+            # Max offset is 15% of frame width
+            lead_offset_x = np.clip(self.velocity_x * 5.0, -w * 0.15, w * 0.15)
+            
             target = np.array(ideal_pos, dtype=np.float32)
+            # Add lead room to the target before smoothing
+            target[0] = np.clip(target[0] + lead_offset_x, 0, w)
+            
+            # Smoothly move current_pos toward target
             self.current_pos += (target - self.current_pos) * self.smoothing
 
         x, y, cw, ch = get_crop_window(frame, self.current_pos, target_w, target_h)

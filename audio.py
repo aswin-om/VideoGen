@@ -209,6 +209,26 @@ def detect_direction_flips(audio_file, start_time, duration_seconds, fps):
         return set()
 
 
+def detect_bass_peaks(audio_file, start_time, duration_seconds, fps):
+    """
+    Specifically isolates low-end peaks for visual impact effects (pumping).
+    """
+    try:
+        y, sr = librosa.load(audio_file, sr=22050, offset=start_time,
+                             duration=duration_seconds, mono=True)
+        if len(y) < sr * 0.1:
+            return set()
+
+        S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
+        # Bins 0-10 are deep bass
+        bass_onset = librosa.onset.onset_strength(S=librosa.power_to_db(S[:10, :]), sr=sr)
+        # High delta for only strong hits
+        peaks = librosa.util.peak_pick(bass_onset, pre_max=5, post_max=5, pre_avg=5, post_avg=5, delta=2.5, wait=12)
+        
+        peak_times = librosa.frames_to_time(peaks, sr=sr)
+        return {int(round(t * fps)) for t in peak_times if 0 <= t < duration_seconds}
+    except:
+        return set()
 def compute_energy_envelope(audio_file, start_time, duration_seconds, fps):
     """
     Compute a smoothed per-frame energy envelope for speed ramping.

@@ -45,6 +45,67 @@ def apply_noise_grain(frame, intensity=0.0):
     return np.clip(noisy_frame, 0, 255).astype(np.uint8)
 
 
+def apply_aesthetic_grade(frame):
+    """
+    Apply a moody 'Teal & Orange' cinematic look.
+    Cooler shadows, warmer midtones/highlights, and slightly higher contrast.
+    """
+    f32 = frame.astype(np.float32) / 255.0
+    
+    # Increase contrast
+    f32 = np.power(f32, 1.1)
+    
+    # Split channels (B, G, R)
+    b, g, r = f32[:,:,0], f32[:,:,1], f32[:,:,2]
+    
+    # Warm highlights (add yellow/orange to bright areas)
+    mask_high = np.clip(f32.mean(axis=2) * 1.5, 0, 1)
+    r += mask_high * 0.05
+    g += mask_high * 0.02
+    
+    # Cool shadows (add teal to dark areas)
+    mask_low = 1.0 - mask_high
+    b += mask_low * 0.05
+    g += mask_low * 0.03
+    
+    f32 = np.clip(np.stack([b, g, r], axis=2), 0, 1)
+    return (f32 * 255.0).astype(np.uint8)
+
+
+class ImpactManager:
+    """Handles audio-reactive zoom and brightness bursts."""
+    def __init__(self):
+        self.impact_level = 0.0 # 0.0 to 1.0
+        
+    def trigger(self):
+        self.impact_level = 1.0
+        
+    def update(self):
+        # Rapid decay for impact
+        self.impact_level *= 0.75
+        if self.impact_level < 0.01:
+            self.impact_level = 0.0
+            
+    def apply(self, frame):
+        if self.impact_level <= 0:
+            return frame
+            
+        # 1. Brightness burst
+        burst = self.impact_level * 15.0
+        frame = cv2.add(frame, np.array([burst, burst, burst], dtype=np.uint8))
+        
+        # 2. Subtle momentary zoom
+        h, w = frame.shape[:2]
+        zoom_factor = 1.0 + (self.impact_level * 0.04)
+        nw, nh = int(w * zoom_factor), int(h * zoom_factor)
+        zoomed = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        
+        # Crop back to original size
+        x1 = (nw - w) // 2
+        y1 = (nh - h) // 2
+        return zoomed[y1:y1+h, x1:x1+w]
+
+
 class StepPrinter:
     """Low shutter / step printing with frame echo (Travis Scott style)."""
 
@@ -84,35 +145,24 @@ class StepPrinter:
 
 def render_video(path, video_files, person_cache, crop_mode, zoom,
                  width, height, fps, noise_intensity, output_dir, progress=None,
-                 step_print_intensity=0.0, status_cb=None):
+                 step_print_intensity=0.0, status_cb=None, impact_set=None):
     """
     Render the timeline to a raw video file.
-    Uses h264_videotoolbox on macOS for hardware acceleration.
     """
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     raw_path = os.path.join(output_dir, f"raw_{timestamp}.mp4")
 
-    # Use hardware acceleration if available (macOS)
     fourcc = "mp4v"
-    try:
-        # Check if we are on macOS and can use VideoToolbox
-        import platform
-        if platform.system() == "Darwin":
-            # VideoWriter usually doesn't expose encoder selection easily,
-            # but we can optimize the ffmpeg muxing later.
-            pass
-    except:
-        pass
-
     out = cv2.VideoWriter(raw_path, cv2.VideoWriter_fourcc(*fourcc), fps, (width, height))
 
     frame_usage = np.zeros(len(video_files), dtype=np.int32)
     captures = {v: cv2.VideoCapture(v) for v in video_files}
-    # Keep track of current frame position for each capture to avoid redundant seeks
     cap_pos = {v: -1 for v in video_files}
 
     printer = StepPrinter(step_print_intensity)
     cropper = SmoothCropManager(smoothing=0.15)
+    impact = ImpactManager()
+    impact_set = impact_set or set()
 
     try:
         total = len(path)
@@ -121,6 +171,10 @@ def render_video(path, video_files, person_cache, crop_mode, zoom,
         for i, (v_path, f_idx, v_idx) in enumerate(path):
             if is_cancelled():
                 raise InterruptedError("Generation cancelled by user.")
+            
+            # --- AUDIO REACTIVE IMPACT ---
+            if i in impact_set:
+                impact.trigger()
 
             if progress and i % 25 == 0:
                 progress(0.55 + 0.35 * (i / max(1, total)), desc="Rendering...")
@@ -130,7 +184,6 @@ def render_video(path, video_files, person_cache, crop_mode, zoom,
             cap = captures[v_path]
             target_f = int(f_idx)
 
-            # Avoid slow seek if we're already at the next frame
             if cap_pos[v_path] != target_f:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, target_f)
 
@@ -145,8 +198,14 @@ def render_video(path, video_files, person_cache, crop_mode, zoom,
                     ideal_pos = get_content_center(frame)
 
                 frame = cropper.process(frame, width, height, zoom, v_path, ideal_pos)
-                # Faster resizing for M2
                 frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+
+                # IMPACT pass
+                frame = impact.apply(frame)
+                impact.update()
+
+                # COLOR GRADE pass (Teal & Orange)
+                frame = apply_aesthetic_grade(frame)
 
                 if noise_intensity > 0:
                     frame = apply_noise_grain(frame, noise_intensity)

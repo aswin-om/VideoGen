@@ -5,7 +5,7 @@ import numpy as np
 
 from audio import (
     parse_time, detect_beats, analyze_audio_features, compute_energy_envelope, 
-    detect_direction_flips, detect_multiband_switches
+    detect_direction_flips, detect_multiband_switches, detect_bass_peaks
 )
 from detection import prescan_person_positions, analyze_video_motion
 from timeline import build_video_meta, build_timeline
@@ -181,6 +181,7 @@ def generate_beat_sync_video(
     notify("audio.detect_multiband_switches", "Analyzing rhythmic switch points")
     beat_set = detect_multiband_switches(audio_file, start_time, duration_seconds, render_fps)
     direction_flip_set = detect_direction_flips(audio_file, start_time, duration_seconds, render_fps)
+    impact_set = detect_bass_peaks(audio_file, start_time, duration_seconds, render_fps)
 
     # Energy envelope for speed ramping
     energy_envelope = None
@@ -235,6 +236,7 @@ def generate_beat_sync_video(
         width, height, render_fps, noise_intensity, output_dir, progress,
         step_print_intensity=step_print,
         status_cb=status_cb,
+        impact_set=impact_set,
     )
 
     # 60fps interpolation

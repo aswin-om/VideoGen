@@ -67,18 +67,30 @@ def _format_live_status(lines):
     )
 
 
+def _video_loading_html(message="Preparing render..."):
+    return f"""
+    <div class="video-loading-shell">
+      <div class="video-loading-core">
+        <div class="video-spinner"></div>
+        <div class="video-loading-title">Generating Preview</div>
+        <div class="video-loading-text">{message}</div>
+      </div>
+    </div>
+    """
+
+
 def run_generator(video_files, audio_file, start_time, duration,
                   noise_intensity, step_print, speed_curve,
                   resolution, target_fps, music_file_path,
                   crop_mode, progress=gr.Progress()):
     if not video_files:
-        yield None, "Please upload videos."
+        yield gr.update(visible=False), gr.update(visible=True, value=None), "Please upload videos."
         return
     chosen_audio = audio_file.name if audio_file is not None else music_file_path
     if chosen_audio and not str(chosen_audio).lower().endswith(SUPPORTED_AUDIO_EXTS):
         chosen_audio = None
     if not chosen_audio:
-        yield None, "Please upload audio or pick a valid song from Songs."
+        yield gr.update(visible=False), gr.update(visible=True, value=None), "Please upload audio or pick a valid song from Songs."
         return
 
     video_paths = [v.name for v in video_files[:5]]
@@ -144,7 +156,11 @@ def run_generator(video_files, audio_file, start_time, duration,
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
-    yield None, _format_live_status(status_lines)
+    yield (
+        gr.update(visible=True, value=_video_loading_html("Preparing render...")),
+        gr.update(visible=False, value=None),
+        _format_live_status(status_lines),
+    )
 
     while not done.is_set() or not status_q.empty():
         updated = False
@@ -152,7 +168,12 @@ def run_generator(video_files, audio_file, start_time, duration,
             status_lines.append(status_q.get())
             updated = True
         if updated:
-            yield None, _format_live_status(status_lines)
+            latest_message = status_lines[-1].split(": ", 1)[1] if ": " in status_lines[-1] else "Working..."
+            yield (
+                gr.update(visible=True, value=_video_loading_html(latest_message)),
+                gr.update(visible=False, value=None),
+                _format_live_status(status_lines),
+            )
         time.sleep(0.2)
 
     try:
@@ -204,12 +225,24 @@ def run_generator(video_files, audio_file, start_time, duration,
             msg += f"- `{clean_name}`: {secs}s\n" if secs > 0 else \
                    f"- `{clean_name}`: Not used\n"
 
-        yield output_video, msg
+        yield (
+            gr.update(visible=False),
+            gr.update(visible=True, value=output_video),
+            msg,
+        )
 
     except InterruptedError:
-        yield None, "### ⏹ Generation cancelled."
+        yield (
+            gr.update(visible=True, value=_video_loading_html("Generation cancelled.")),
+            gr.update(visible=False, value=None),
+            "### ⏹ Generation cancelled.",
+        )
     except Exception as e:
-        yield None, f"Error: {e}"
+        yield (
+            gr.update(visible=True, value=_video_loading_html("Generation failed.")),
+            gr.update(visible=False, value=None),
+            f"Error: {e}",
+        )
 
 
 def stop_generation():
@@ -235,6 +268,47 @@ body, .gradio-container { background-color: #000000 !important; color: #a3a3a3 !
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 13px;
   line-height: 1.5;
+}
+.video-shell {
+  position: relative;
+}
+.video-loading-shell {
+  height: 420px;
+  border: 1px solid #333333;
+  border-radius: 12px;
+  background:
+    radial-gradient(circle at top, rgba(249, 115, 22, 0.18), transparent 38%),
+    linear-gradient(180deg, #151515 0%, #0b0b0b 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.video-loading-core {
+  text-align: center;
+  color: #f5f5f5;
+}
+.video-spinner {
+  width: 64px;
+  height: 64px;
+  border-radius: 999px;
+  border: 4px solid rgba(249, 115, 22, 0.18);
+  border-top-color: #f97316;
+  margin: 0 auto 18px auto;
+  animation: spin 0.9s linear infinite;
+  box-shadow: 0 0 24px rgba(249, 115, 22, 0.18);
+}
+.video-loading-title {
+  font-size: 24px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.video-loading-text {
+  font-size: 14px;
+  color: #b3b3b3;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 footer { display: none !important; }
 """
@@ -291,28 +365,14 @@ with gr.Blocks() as demo:
             with gr.Row():
                 generate_btn = gr.Button("▶ Generate", variant="primary",
                                          elem_id="generate_btn")
-                aesthetic_btn = gr.Button("✨ Aesthetic Slow-Mo", elem_id="auto_calc_btn")
                 cancel_btn = gr.Button("⏹ Stop", elem_id="cancel_btn")
 
         with gr.Column(scale=2):
-            video_output = gr.Video(label=None, height=420)
+            with gr.Group(elem_classes="video-shell"):
+                video_loading = gr.HTML(_video_loading_html("Waiting for generation..."), visible=False)
+                video_output = gr.Video(label=None, height=420, visible=True)
             status_output = gr.Markdown("### 🕒 Waiting for Input...")
             copy_log_btn = gr.Button("Copy Output Log")
-
-    def apply_aesthetic_preset():
-        return [
-            "1080p Square (1080×1080)",
-            "60 fps (Interpolated)",
-            0.08,
-            0.55,
-            "Person/Car (YOLO)"
-        ]
-
-    aesthetic_btn.click(
-        fn=apply_aesthetic_preset,
-        outputs=[resolution_input, fps_input, noise_intensity_input, 
-                 step_print_input, crop_mode_input]
-    )
 
     # Generate
     gen_event = generate_btn.click(
@@ -320,7 +380,7 @@ with gr.Blocks() as demo:
         inputs=[video_input, audio_input, start_time_input, duration_input,
                 noise_intensity_input, step_print_input, gr.State("None"),
                 resolution_input, fps_input, music_file_input, crop_mode_input],
-        outputs=[video_output, status_output],
+        outputs=[video_loading, video_output, status_output],
     )
 
     demo.load(
